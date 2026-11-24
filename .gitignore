@@ -1,3 +1,4 @@
+
 # Logs
 logs
 *.log
@@ -7,15 +8,16 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
-node_modules
-dist
-dist-ssr
+# Dependencies and builds
+node_modules/
+dist/
+dist-ssr/
 *.local
 
-# Editor directories and files
+# Editors
 .vscode/*
 !.vscode/extensions.json
-.idea
+.idea/
 .DS_Store
 *.suo
 *.ntvs*
@@ -23,14 +25,15 @@ dist-ssr
 *.sln
 *.sw?
 
-# Secrets & local state
+# Environment secrets
 .env
 .env.*
 !.env.example
-backups/
-supabase/.temp
-supabase/.branches
 
+# Backups and local state
+backups/
+supabase/.temp/
+supabase/.branches/
 
 # Firebase
 .firebase/
@@ -41,9 +44,9 @@ storage-debug.log
 ui-debug.log
 functions/lib/
 functions/node_modules/
-# copied from src/shared/ai by functions/scripts/copy-shared.mjs (prebuild)
 functions/src/shared/
-
-# local Firebase emulator secrets
 .secret.local
 functions/.secret.local
+
+# Generated files
+Makefile

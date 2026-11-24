@@ -1,0 +1,155 @@
+import { describe, expect, it } from 'vitest'
+import { createTestDb, ok } from './testing'
+
+describe('backend engine (PostgREST-compatible API on the document store)', () => {
+  it('applies defaults, numbering, audit and returns inserted rows', async () => {
+    const t = createTestDb()
+    const admin = t.addUser('super_admin')
+    const db = t.as(admin)
+    const client = ok(await db.from('clients').insert({ name: 'Acme Ltd' }).select().single())
+    expect(client.id).toMatch(/[0-9a-f-]{36}/)
+    expect(client.client_type).toBe('company')
+    expect(client.created_by).toBe(admin)
+    expect(client.created_at).toBeTruthy()
+    const logs = t.raw.all('audit_logs').filter((l) => l.table_name === 'clients')
+    expect(logs).toHaveLength(1)
+    expect(logs[0].action).toBe('INSERT')
+  })
+
+  it('filters, orders, limits, counts and supports or/ilike/in/is', async () => {
+    const t = createTestDb()
+    const db = t.as(t.addUser('super_admin'))
+    ok(await db.from('clients').insert([{ name: 'Beta' }, { name: 'alpha', tin: '1' }, { name: 'Gamma', client_type: 'government' }]))
+    const asc = ok(await db.from('clients').select('name').order('name'))
+    expect(asc.map((r) => r.name)).toEqual(['alpha', 'Beta', 'Gamma'])
+    const ilike = ok(await db.from('clients').select('name').ilike('name', '%A%').order('name', { ascending: false }).limit(2))
+    expect(ilike.map((r) => r.name)).toEqual(['Gamma', 'Beta'])
+    const or = ok(await db.from('clients').select('name').or('client_type.eq.government,tin.eq.1').order('name'))
+    expect(or.map((r) => r.name)).toEqual(['alpha', 'Gamma'])
+    const isNull = ok(await db.from('clients').select('name').is('tin', null))
+    expect(isNull).toHaveLength(2)
+    const inn = ok(await db.from('clients').select('name').in('name', ['Beta', 'Gamma']))
+    expect(inn).toHaveLength(2)
+    const { count } = await db.from('clients').select('id', { count: 'exact', head: true }).eq('client_type', 'company')
+    expect(count).toBe(2)
+    const single = await db.from('clients').select('*').eq('name', 'nope').single()
+    expect(single.error?.code).toBe('PGRST116')
+    const maybe = await db.from('clients').select('*').eq('name', 'nope').maybeSingle()
+    expect(maybe.error).toBeNull()
+    expect(maybe.data).toBeNull()
+  })
+
+  it('resolves embeds: many-to-one with fk hints, nested, and one-to-many', async () => {
+    const t = createTestDb()
+    const admin = t.addUser('super_admin', { name: 'Asha' })
+    const db = t.as(admin)
+    const c = ok(await db.from('clients').insert({ name: 'Client A' }).select().single())
+    const p = ok(await db.from('projects').insert({ name: 'Tower', client_id: c.id, project_manager_id: admin }).select().single())
+    const rows = ok(
+      await db.from('projects').select('id,name,client:clients(name),manager:profiles!projects_project_manager_id_fkey(full_name)').eq('id', p.id),
+    )
+    expect(rows[0]).toMatchObject({ name: 'Tower', client: { name: 'Client A' }, manager: { full_name: 'Asha' } })
+    ok(await db.from('project_members').upsert({ project_id: p.id, user_id: admin, member_role: 'member' }))
+    const withMembers = ok(await db.from('projects').select('name, project_members(user_id, user:profiles(full_name, role:roles(name)))').single())
+    expect(withMembers.project_members[0].user).toMatchObject({ full_name: 'Asha', role: { name: 'Super Administrator' } })
+  })
+
+  it('upsert on a composite key updates instead of duplicating', async () => {
+    const t = createTestDb()
+    const admin = t.addUser('super_admin')
+    const db = t.as(admin)
+    const p = ok(await db.from('projects').insert({ name: 'Bridge' }).select().single())
+    ok(await db.from('project_members').upsert({ project_id: p.id, user_id: admin, member_role: 'member' }))
+    ok(await db.from('project_members').upsert({ project_id: p.id, user_id: admin, member_role: 'supervisor' }))
+    const m = t.raw.all('project_members')
+    expect(m).toHaveLength(1)
+    expect(m[0].member_role).toBe('supervisor')
+  })
+
+  it('cascades deletes and blocks restricted deletes', async () => {
+    const t = createTestDb()
+    const admin = t.addUser('super_admin')
+    const db = t.as(admin)
+    const p = ok(await db.from('projects').insert({ name: 'Road' }).select().single())
+    ok(await db.from('project_members').insert({ project_id: p.id, user_id: admin }))
+    ok(await db.from('projects').delete().eq('id', p.id))
+    expect(t.raw.all('project_members')).toHaveLength(0)
+  })
+
+  it('enforces NOT NULL and unique constraints', async () => {
+    const t = createTestDb()
+    const db = t.as(t.addUser('super_admin'))
+    const bad = await db.from('clients').insert({ name: null })
+    expect(bad.error?.code).toBe('23502')
+    const p = ok(await db.from('projects').insert({ name: 'X1', code: 'P-1' }).select().single())
+    expect(p.code).toBe('P-1')
+    const dup = await db.from('projects').insert({ name: 'X2', code: 'P-1' })
+    expect(dup.error?.code).toBe('23505')
+  })
+
+  it('scopes reads for users without company-wide access', async () => {
+    const t = createTestDb()
+    const admin = t.addUser('super_admin')
+    const eng = t.addUser('site_engineer')
+    let db = t.as(admin)
+    const a = ok(await db.from('projects').insert({ name: 'Mine' }).select().single())
+    ok(await db.from('projects').insert({ name: 'Other' }))
+    ok(await db.from('project_members').insert({ project_id: a.id, user_id: eng }))
+    db = t.as(eng)
+    const me = await db.me()
+    expect(me?.viewAll).toBe(false)
+    expect(me?.projectIds).toEqual([a.id])
+  })
+
+  it('inactive users see only their own profile; my_permissions follows the role matrix', async () => {
+    const t = createTestDb()
+    const pending = t.addUser('employee', { active: false })
+    t.addUser('super_admin')
+    let db = t.as(pending)
+    expect(ok(await db.from('profiles').select('id'))).toHaveLength(1)
+    expect(ok(await db.rpc('my_permissions'))).toEqual([])
+    const qs = t.addUser('quantity_surveyor')
+    db = t.as(qs)
+    const perms = ok(await db.rpc('my_permissions')) as string[]
+    expect(perms).toContain('boq.manage')
+    expect(perms).not.toContain('users.manage')
+  })
+
+  it('role_permissions edits keep roles.perms in sync', async () => {
+    const t = createTestDb()
+    const db = t.as(t.addUser('super_admin'))
+    ok(await db.from('role_permissions').insert({ role_id: 'employee', permission_id: 'boq.view' }))
+    expect(t.raw.get('roles', 'employee')!.perms).toContain('boq.view')
+    ok(await db.from('role_permissions').delete().match({ role_id: 'employee', permission_id: 'boq.view' }))
+    expect(t.raw.get('roles', 'employee')!.perms).not.toContain('boq.view')
+  })
+
+  it('protects profiles: no self-escalation, last super admin stays', async () => {
+    const t = createTestDb()
+    const admin = t.addUser('super_admin')
+    const emp = t.addUser('employee')
+    let db = t.as(emp)
+    const esc = await db.from('profiles').update({ role_id: 'super_admin' }).eq('id', emp)
+    expect(esc.error?.code).toBe('42501')
+    ok(await db.from('profiles').update({ phone: '0700' }).eq('id', emp))
+    db = t.as(admin)
+    const demote = await db.from('profiles').update({ role_id: 'employee' }).eq('id', admin)
+    expect(demote.error?.message).toMatch(/Super Administrator/)
+  })
+
+  it('realtime channel reports inserted rows matching the filter', async () => {
+    const t = createTestDb()
+    const admin = t.addUser('super_admin')
+    const other = t.addUser('employee')
+    const db = t.as(admin)
+    const seen: unknown[] = []
+    const ch = db
+      .channel('n')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'notifications', filter: `user_id=eq.${other}` }, (p) => seen.push(p.new))
+      .subscribe()
+    ok(await db.from('notifications').insert({ user_id: other, title: 'Hi' }))
+    ok(await db.from('notifications').insert({ user_id: admin, title: 'Me' }))
+    expect(seen).toHaveLength(1)
+    await db.removeChannel(ch)
+  })
+})

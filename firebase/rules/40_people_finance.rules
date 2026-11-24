@@ -1,0 +1,148 @@
+    // ================================================================ workforce / HR + finance (…0400 + RLS in …0500)
+    // List queries the engine issues (src/backend/domains/people_finance.ts scopes):
+    //   company-wide users: unconstrained; others: project_id == pid per project (+ project_id == null);
+    //   self-service: employees.profile_id == uid, <table>.employee_profile_id == uid (payroll: + status == 'paid').
+    // employee_profile_id is a denormalised copy of employees.profile_id (set by the engine on insert,
+    // re-synced when the employee's linked account changes).
+
+    // the engine re-pointing employee_profile_id after employees.profile_id changed in the same transaction
+    function pfOwnerSync() {
+      return hasPerm('hr.manage')
+        && onlyChanges(['employee_profile_id', 'updated_at'])
+        && incoming().employee_profile_id == getAfter(path('employees', existing().employee_id)).data.profile_id;
+    }
+    // employee_profile_id untouched, or re-derived correctly from the (new) employee
+    function pfOwnerOk() {
+      return (incoming().employee_profile_id == existing().employee_profile_id && incoming().employee_id == existing().employee_id)
+        || incoming().employee_profile_id == getAfter(path('employees', incoming().employee_id)).data.profile_id;
+    }
+    function pfOwnerOnCreate() {
+      return incoming().employee_profile_id == getAfter(path('employees', incoming().employee_id)).data.profile_id;
+    }
+    function pfSelf(data) {
+      return isActive() && data.employee_profile_id == uid();
+    }
+
+    // ---------------------------------------------------------------- employees (directory, non-confidential)
+    match /employees/{id} {
+      allow read: if hasPerm('hr.view') || (isActive() && resource.data.profile_id == uid());
+      allow create: if hasPerm('hr.manage');
+      // re-linking a user account must be able to re-sync the employee's attendance / leave / pay rows
+      allow update: if hasPerm('hr.manage')
+        && (keeps(['profile_id']) || (hasPerm('hr.payroll') && hasPerm('hr.view') && hasPerm('projects.view_all')));
+      allow delete: if hasPerm('hr.manage') && hasPerm('hr.payroll') && hasPerm('projects.view_all');
+    }
+
+    // ---------------------------------------------------------------- confidential pay details
+    match /employee_compensation/{employeeId} {
+      allow read: if hasPerm('hr.payroll') || pfSelf(resource.data);
+      allow create: if hasPerm('hr.payroll') && incoming().employee_id == employeeId && pfOwnerOnCreate();
+      allow update: if (hasPerm('hr.payroll') && keeps(['employee_id']) && pfOwnerOk()) || pfOwnerSync();
+      allow delete: if hasPerm('hr.payroll');
+    }
+
+    // ---------------------------------------------------------------- site assignments (project-scoped)
+    match /employee_assignments/{id} {
+      allow read: if hasPerm('hr.view') && canAccess(resource.data.project_id);
+      allow create: if hasPerm('hr.manage') && incoming().project_id != null && canAccess(incoming().project_id);
+      allow update: if hasPerm('hr.manage') && canAccess(existing().project_id)
+        && incoming().project_id != null && canAccess(incoming().project_id);
+      allow delete: if hasPerm('hr.manage') && canAccess(existing().project_id);
+    }
+
+    // ---------------------------------------------------------------- attendance & timesheets
+    // Document id = {employee_id}__{work_date} (UNIQUE), so a duplicate on a project the writer
+    // cannot see turns into an update of an existing document and is rejected here.
+    // employee_profile_id is not re-checked on create: the attendance sheet saves many employees in one
+    // transaction and Firestore allows only 20 document lookups per transaction (writers are trusted
+    // hr.attendance holders; the engine derives the value).
+    match /attendance/{id} {
+      allow read: if (hasPerm('hr.view') && canAccess(resource.data.project_id)) || pfSelf(resource.data);
+      allow create: if hasPerm('hr.attendance') && canAccess(incoming().project_id);
+      allow update: if (hasPerm('hr.attendance') && canAccess(existing().project_id) && canAccess(incoming().project_id) && pfOwnerOk())
+        || pfOwnerSync();
+      allow delete: if hasPerm('hr.manage');
+    }
+
+    // ---------------------------------------------------------------- leave
+    match /leave_requests/{id} {
+      allow read: if hasPerm('hr.view') || pfSelf(resource.data);
+      allow create: if pfOwnerOnCreate()
+        && (hasPerm('hr.manage')
+            || (isActive() && incoming().employee_profile_id == uid()
+                && incoming().status == 'pending'
+                && incoming().approved_by == null && incoming().approved_at == null
+                && incoming().created_by == uid()));
+      allow update: if (hasPerm('hr.manage')
+                        && pfOwnerOk()
+                        // a decision always records who made it
+                        && (!(incoming().status in ['approved', 'rejected']) || incoming().status == existing().status
+                            || incoming().approved_by == uid()))
+        || (isActive()
+            && existing().status == 'pending' && existing().employee_profile_id == uid()
+            && incoming().employee_profile_id == uid() && pfOwnerOk()
+            && incoming().status in ['pending', 'cancelled']
+            && keeps(['approved_by', 'approved_at', 'created_by']))
+        || pfOwnerSync();
+      // only through the employee cascade (no delete policy existed for users)
+      allow delete: if hasPerm('hr.manage');
+    }
+
+    // ---------------------------------------------------------------- payroll (confidential)
+    // employee_profile_id is not re-checked on create (generate_payroll writes up to 200 payslips per
+    // transaction; 20-lookup limit) — only hr.payroll holders, who can read all payslips anyway, may create.
+    match /payroll_records/{id} {
+      allow read: if hasPerm('hr.payroll')
+        || (pfSelf(resource.data) && resource.data.status == 'paid');
+      allow create: if hasPerm('hr.payroll');
+      allow update: if (hasPerm('hr.payroll') && pfOwnerOk()) || pfOwnerSync();
+      allow delete: if hasPerm('hr.payroll');
+    }
+
+    // ---------------------------------------------------------------- client invoices
+    match /client_invoices/{id} {
+      allow read: if hasPerm('finance.view') && canAccess(resource.data.project_id);
+      allow create: if hasPerm('finance.manage');
+      // approvers move the payment status when approving / voiding a receipt against the invoice
+      allow update: if hasPerm('finance.manage')
+        || (hasPerm('finance.approve') && onlyChanges(['status', 'updated_at'])
+            && incoming().status in ['issued', 'partially_paid', 'paid']);
+      allow delete: if hasPerm('finance.manage');
+    }
+
+    // ---------------------------------------------------------------- financial transactions
+    // Segregation of duties, approval only with finance.approve, approved = locked (void with reason only),
+    // and no deletes at all (no `allow delete`).
+    match /financial_transactions/{id} {
+      function seniorApprover() { return isActive() && role().key in ['super_admin', 'managing_director']; }
+
+      allow read: if hasPerm('finance.view') && canAccess(resource.data.project_id);
+
+      allow create: if hasPerm('finance.manage') && canAccess(incoming().project_id)
+        && incoming().created_by == uid()
+        && ((incoming().status == 'pending' && incoming().approved_by == null)
+            || (seniorApprover() && incoming().approved_by == uid()));
+
+      allow update: if hasAnyPerm(['finance.manage', 'finance.approve'])
+        && keeps(['number', 'created_by', 'created_at'])
+        && (
+          // (a) edit / re-submit / void a pending or rejected transaction — no decision, approver untouched
+          (existing().status in ['pending', 'rejected']
+            && (incoming().status == existing().status || incoming().status in ['pending', 'void'])
+            && keeps(['approved_by', 'approved_at'])
+            && canAccess(incoming().project_id))
+          // (b) approve / reject: finance.approve, never your own transaction (unless MD / super admin),
+          //     and nothing else may change in the same write
+          || (existing().status in ['pending', 'rejected']
+            && incoming().status in ['approved', 'rejected'] && incoming().status != existing().status
+            && hasPerm('finance.approve')
+            && incoming().approved_by == uid()
+            && (incoming().status == 'rejected' || existing().created_by != uid() || seniorApprover())
+            && onlyChanges(['status', 'approved_by', 'approved_at', 'updated_at']))
+          // (c) void an approved transaction: finance.approve + reason, nothing else changes
+          || (existing().status == 'approved' && incoming().status == 'void'
+            && hasPerm('finance.approve')
+            && incoming().void_reason is string && incoming().void_reason.trim().size() > 0
+            && onlyChanges(['status', 'void_reason', 'updated_at']))
+        );
+    }

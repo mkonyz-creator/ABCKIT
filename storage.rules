@@ -1,0 +1,109 @@
+rules_version = '2';
+
+// =============================================================================
+// ABCkit — Cloud Storage security rules (replaces the storage.objects policies of
+// legacy-supabase/migrations/…0600_analytics_storage.sql). The old buckets are top-level folders:
+//
+//   documents/{project_id | general}/{document_id}/{file}    private, ≤ 50 MB, office / image / CAD types
+//   site-photos/{project_id}/{report_key}/{file}             private, ≤ 10 MB, images
+//   project-photos/{project_id}/{file}                       private, ≤ 10 MB, images
+//   branding/{file}                                          public read, settings.manage writes, ≤ 2 MB
+//
+// LIMIT: Storage rules may read at most TWO Firestore documents per evaluation. The caller's profile
+// (is_active, role_id) is always the first; the second is chosen from the profile:
+//   - company-wide roles (listed below, verified live against roles/{role}.perms incl. projects.view_all)
+//     → roles/{role_id}
+//   - every other role → project_members/{project_id}__{uid}, which carries a copy of the member's role_id
+//     and permission list (written by src/backend/domains/projects.ts, verified against profiles / roles by
+//     firestore.rules, re-synced on role / permission changes). role_id must still match the live profile.
+// A role that is granted projects.view_all later but is not listed here keeps member-scoped file access
+// (fail-safe). Update COMPANY_WIDE together with the permission matrix.
+// =============================================================================
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function signedIn() { return request.auth != null; }
+    function companyWide() {
+      return ['super_admin', 'administrator', 'managing_director', 'quantity_surveyor', 'accountant', 'procurement_officer', 'storekeeper', 'hr_officer'];
+    }
+    function isUuid(s) {
+      return s.matches('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$');
+    }
+
+    // Firestore document #1
+    function me() { return firestore.get(/databases/(default)/documents/profiles/$(request.auth.uid)).data; }
+    // Firestore document #2 (company-wide / no project)
+    function roleOf(roleId) { return firestore.get(/databases/(default)/documents/roles/$(roleId)).data; }
+
+    // any of `perms`, not tied to a project (profile + role)
+    function can(perms) {
+      let p = me();
+      let r = roleOf(p.role_id);
+      return p.is_active == true && (r.key == 'super_admin' || r.perms.hasAny(perms));
+    }
+
+    // any of `perms` inside project `pid` (can_access_project + has_permission), two documents at most
+    function canIn(pid, perms) {
+      let p = me();
+      return isUuid(pid) && p.is_active == true
+        && (p.role_id in companyWide() ? roleAllows(p.role_id, perms) : memberAllows(pid, p.role_id, perms));
+    }
+    function roleAllows(roleId, perms) {
+      let r = roleOf(roleId);
+      return r.key == 'super_admin' || (r.perms.hasAny(perms) && 'projects.view_all' in r.perms);
+    }
+    function memberAllows(pid, roleId, perms) {
+      let m = /databases/(default)/documents/project_members/$(pid + '__' + request.auth.uid);
+      return firestore.exists(m) && firestore.get(m).data.role_id == roleId && firestore.get(m).data.perms.hasAny(perms);
+    }
+
+    function under(mb) { return request.resource.size > 0 && request.resource.size <= mb * 1024 * 1024; }
+
+    // ------------------------------------------------------------------ documents
+    // Read: documents.view + project access. The document's access_level (management / restricted) would need
+    // a third Firestore read; object paths are only revealed through document_versions rows, which
+    // firestore.rules filter by access level.
+    match /documents/{folder}/{docId}/{file} {
+      allow get: if signedIn()
+        && (folder == 'general' ? can(['documents.view']) : canIn(folder, ['documents.view']));
+      allow create: if signedIn()
+        && (folder == 'general' ? can(['documents.manage']) : canIn(folder, ['documents.manage']))
+        && resource == null && under(50)
+        && request.resource.contentType in [
+          'application/pdf', 'image/jpeg', 'image/png', 'image/webp', 'image/gif',
+          'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+          'application/vnd.ms-excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          'application/vnd.ms-powerpoint', 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+          'text/plain', 'text/csv', 'application/zip', 'application/x-zip-compressed',
+          'image/vnd.dwg', 'application/acad', 'application/dxf', 'image/vnd.dxf', 'application/octet-stream'];
+      // immutable (resource == null: no overwrite) and never deletable through the API, like the SQL policies
+    }
+
+    // ------------------------------------------------------------------ site report photos
+    // update = an offline sync retry re-uploading the same object (Supabase answered "Duplicate")
+    match /site-photos/{projectId}/{reportKey}/{file} {
+      allow get: if signedIn() && canIn(projectId, ['site.view']);
+      allow create, update: if signedIn() && canIn(projectId, ['site.report'])
+        && under(10) && request.resource.contentType in ['image/jpeg', 'image/png', 'image/webp', 'image/heic'];
+    }
+
+    // ------------------------------------------------------------------ project photos
+    match /project-photos/{projectId}/{file} {
+      allow read: if signedIn() && canIn(projectId, ['projects.view']);
+      allow create: if signedIn() && canIn(projectId, ['projects.manage', 'site.report'])
+        && resource == null && under(10) && request.resource.contentType in ['image/jpeg', 'image/png', 'image/webp'];
+      allow delete: if signedIn() && canIn(projectId, ['projects.manage']);
+    }
+
+    // ------------------------------------------------------------------ branding (public bucket)
+    match /branding/{file} {
+      allow get: if true;
+      allow create, update: if signedIn() && can(['settings.manage'])
+        && under(2) && request.resource.contentType in ['image/png', 'image/jpeg', 'image/svg+xml', 'image/webp'];
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

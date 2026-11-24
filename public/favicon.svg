@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="ABCkit">
+  <!-- ABCkit toolbox logo in the system palette: orange #FF6B00, black #000, white -->
+  <defs>
+    <mask id="jaw">
+      <rect x="-80" y="-200" width="160" height="400" fill="#fff"/>
+      <rect x="-15" y="-190" width="30" height="62" rx="4" fill="#000"/>
+    </mask>
+  </defs>
+  <g stroke="#000" stroke-linejoin="round" paint-order="stroke">
+    <!-- handle -->
+    <path d="M118 278 L146 116 H366 L394 278" fill="none" stroke-width="44" stroke-linecap="round"/>
+    <path d="M118 278 L146 116 H366 L394 278" fill="none" stroke="#FF6B00" stroke-width="22" stroke-linecap="round"/>
+    <!-- hammer -->
+    <g transform="translate(168 214) rotate(-36)" fill="#FF6B00" stroke-width="12">
+      <rect x="-12" y="-50" width="24" height="220" rx="9"/>
+      <!-- head with a striking face on the right and a tapered peen on the left -->
+      <path d="M-50 -102 H48 V-52 H-50 L-78 -66 V-88 Z"/>
+      <rect x="44" y="-112" width="28" height="70" rx="7"/>
+    </g>
+    <!-- screwdriver -->
+    <g transform="translate(256 186) rotate(10)" fill="#FF6B00" stroke-width="12">
+      <path d="M-8 -36 V-150 L0 -172 L8 -150 V-36 Z"/>
+      <rect x="-26" y="-40" width="52" height="150" rx="16"/>
+      <path d="M-10 -22 V90 M0 -22 V90 M10 -22 V90" fill="none" stroke-width="5" paint-order="normal"/>
+    </g>
+    <!-- wrench -->
+    <g transform="translate(352 206) rotate(36)" fill="#FF6B00" stroke-width="12">
+      <rect x="-17" y="-70" width="34" height="230" rx="13"/>
+      <circle cx="0" cy="-112" r="50" mask="url(#jaw)"/>
+    </g>
+    <!-- box -->
+    <rect x="40" y="262" width="432" height="214" rx="44" fill="#FF6B00" stroke-width="14"/>
+  </g>
+  <rect x="47" y="269" width="418" height="22" rx="11" fill="#000"/>
+  <!-- A B C tiles + Kit -->
+  <g font-family="'Arial Black', 'Segoe UI Black', Arial, Helvetica, sans-serif" font-weight="900" text-anchor="middle">
+    <rect x="66" y="318" width="94" height="104" rx="14" fill="#000"/>
+    <rect x="172" y="318" width="94" height="104" rx="14" fill="#000"/>
+    <rect x="278" y="318" width="94" height="104" rx="14" fill="#000"/>
+    <text x="113" y="398" font-size="80" fill="#fff">A</text>
+    <text x="219" y="398" font-size="80" fill="#fff">B</text>
+    <text x="325" y="398" font-size="80" fill="#fff">C</text>
+    <text x="422" y="404" font-size="58" fill="#000" font-family="'Segoe UI', Arial, Helvetica, sans-serif" font-weight="800">Kit</text>
+  </g>
+</svg>

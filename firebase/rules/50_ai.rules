@@ -1,0 +1,122 @@
+    // ================================================================ AI Intelligence (src/shared/ai/contract.ts)
+    // Cloud Functions (Admin SDK) write emails, drafts, alerts, usage, status and accounts; rules do not apply to them.
+    // The web app reads business data for the assistant under the caller's own rules (never through the server).
+    // List queries the engine issues (src/backend/domains/ai.ts scopes):
+    //   ai_chats, ai_memories: user_id == uid; ai_activity: unconstrained for ai.manage, else actor_id == uid; others unconstrained.
+
+    // AI permission = the role's permission (hasPerm, incl. super_admin) OR an individual grant in user_access/{uid}
+    // (User Management → Email access; written only by the adminUsers function). Grants never bypass isActive().
+    function aiGrant(p) {
+      let g = path('user_access', uid());
+      return exists(g) && get(g).data.perms is list && p in get(g).data.perms;
+    }
+    function aiPerm(p) { return hasPerm(p) || (isActive() && aiGrant(p)); }
+
+    // a user may read their own grant; user administrators read all; nobody writes from the app
+    match /user_access/{id} {
+      allow read: if isActive() && (id == uid() || hasPerm('users.manage'));
+      allow write: if false;
+    }
+
+    function aiAlertOk() {
+      return incoming().status in ['acknowledged', 'resolved']
+        && (incoming().acknowledged_by == existing().acknowledged_by || incoming().acknowledged_by == uid());
+    }
+    function aiValidParties(list) {
+      return list is list && list.size() <= 50;
+    }
+
+    // ---------------------------------------------------------------- email intelligence
+    match /ai_emails/{id} {
+      allow read: if aiPerm('ai.email');
+    }
+
+    match /ai_email_drafts/{id} {
+      allow read: if aiPerm('ai.email');
+      // drafts are created and sent by functions (emailGenerateReply / emailSendDraft)
+      // a person may edit the reply text and recipients while it is a draft, or discard it
+      allow update: if aiPerm('ai.email') && existing().status == 'draft'
+        && ((incoming().status == 'draft'
+              && onlyChanges(['body', 'subject', 'to', 'cc', 'language', 'updated_at'])
+              && incoming().body is string && incoming().body.size() <= 50000
+              && incoming().subject is string && incoming().subject.size() <= 300
+              && aiValidParties(incoming().to) && incoming().to.size() > 0 && aiValidParties(incoming().cc)
+              && incoming().language in ['en', 'sw'])
+            || (incoming().status == 'discarded' && onlyChanges(['status', 'updated_at'])));
+    }
+
+    match /email_accounts/{id} {
+      allow read: if aiPerm('ai.manage') || aiPerm('ai.email');
+    }
+
+    // OAuth refresh tokens / IMAP passwords and OAuth nonces: server only
+    match /email_account_secrets/{id} {
+      allow read, write: if false;
+    }
+    match /email_oauth_states/{id} {
+      allow read, write: if false;
+    }
+    // AI provider API keys entered in the AI Control Center: encrypted, read and written only by Cloud Functions
+    match /ai_provider_keys/{id} {
+      allow read, write: if false;
+    }
+
+    // ---------------------------------------------------------------- alerts, reports, chats
+    match /ai_alerts/{id} {
+      allow read: if aiPerm('ai.view');
+      allow update: if aiPerm('ai.view')
+        && onlyChanges(['status', 'acknowledged_by', 'acknowledged_at', 'resolved_at'])
+        && aiAlertOk();
+    }
+
+    match /ai_reports/{id} {
+      allow read: if aiPerm('ai.view');
+      allow create: if aiPerm('ai.view') && incoming().generated_by == uid()
+        && incoming().content_md is string && incoming().content_md.size() <= 400000;
+    }
+
+    match /ai_chats/{id} {
+      allow read: if aiPerm('ai.view') && resource.data.user_id == uid();
+      allow create: if aiPerm('ai.view') && incoming().user_id == uid();
+      allow update: if aiPerm('ai.view') && existing().user_id == uid() && incoming().user_id == uid();
+      allow delete: if aiPerm('ai.view') && existing().user_id == uid();
+    }
+
+    // the assistant's memory: what the user asked it to remember, private to that user
+    match /ai_memories/{id} {
+      allow read: if aiPerm('ai.view') && resource.data.user_id == uid();
+      allow create: if aiPerm('ai.view') && incoming().user_id == uid()
+        && incoming().text is string && incoming().text.size() > 0 && incoming().text.size() <= 500;
+      allow update: if aiPerm('ai.view') && existing().user_id == uid() && incoming().user_id == uid()
+        && incoming().text is string && incoming().text.size() > 0 && incoming().text.size() <= 500;
+      allow delete: if aiPerm('ai.view') && existing().user_id == uid();
+    }
+
+    // ---------------------------------------------------------------- knowledge base
+    match /ai_knowledge/{id} {
+      allow read: if aiPerm('ai.view');
+      allow create: if aiPerm('ai.manage') && incoming().created_by == uid();
+      allow update: if aiPerm('ai.manage') && keeps(['created_by', 'created_at']);
+      allow delete: if aiPerm('ai.manage');
+    }
+
+    // ---------------------------------------------------------------- audit trail & usage
+    match /ai_activity/{id} {
+      allow read: if aiPerm('ai.manage') || (aiPerm('ai.view') && resource.data.actor_id == uid());
+      // the app records its own chat / report / voice runs and confirmed assistant actions; everything else is written by functions
+      allow create: if aiPerm('ai.view') && incoming().actor_id == uid() && incoming().action in ['chat', 'report', 'voice', 'assistant_action'];
+    }
+
+    match /ai_usage/{id} {
+      allow read: if aiPerm('ai.manage');
+    }
+
+    // ---------------------------------------------------------------- settings & status
+    match /ai_settings/{id} {
+      allow read: if aiPerm('ai.view');
+      allow create, update: if aiPerm('ai.manage') && id == 'settings' && incoming().id == 'settings';
+    }
+
+    match /ai_status/{id} {
+      allow read: if aiPerm('ai.view');
+    }

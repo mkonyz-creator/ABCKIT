@@ -1,0 +1,294 @@
+
+    // ================================================================ projects, BOQ, documents, tasks
+    // (…0200_projects_boq.sql, documents / tasks of …0400, RLS in …0500; hooks: src/backend/domains/projects.ts)
+    // List queries the engine issues (scopes in projects.ts):
+    //   company-wide users: unconstrained; others: project_id == pid per accessible project
+    //   (+ project_id == null for tasks / documents), plus
+    //   projects:  id == pid, project_manager_id == uid, created_by == uid
+    //   project_members: user_id == uid;  tasks: assigned_to == uid
+    //   documents / document_versions: additionally access_level == 'project' | 'management'
+    //   unless the caller holds documents.restricted.
+    // boq_sections / boq_items / document_versions carry project_id (and access_level) copied from their
+    // parent by the engine (defineInherit), so reads never need the parent document.
+    //
+    // Write rules load the caller's profile / role and the changed-key set once and pass them down
+    // (pjMe / pjR / ck): re-evaluating hasPerm() and diff() in every branch exceeds the
+    // 1000-expressions-per-write limit on wide documents.
+
+    function pjAfter(coll, id) { return getAfter(path(coll, id)).data; }
+    function pjMe() { return get(path('profiles', uid())).data; }
+    function pjR(me) { return get(path('roles', me.role_id)).data; }
+    function pjCan(me, r, p) { return me.is_active == true && (r.key == 'super_admin' || p in r.perms); }
+    function pjAcc(me, r, pid) {
+      return pid == null
+        || pjCan(me, r, 'projects.view_all')
+        || (me.is_active == true
+            && (exists(path('project_members', pid + '__' + uid()))
+                || get(path('projects', pid)).data.project_manager_id == uid()));
+    }
+    function pjCk() { return request.resource.data.diff(resource.data).affectedKeys(); }
+
+    // ---------------------------------------------------------------- clients
+    function pjClientOk(d) {
+      return d.name is string && d.name.size() >= 1 && d.name.size() <= 200
+        && d.client_type in ['company', 'government', 'individual', 'ngo'];
+    }
+    function pjClientWrite(me, ck) {
+      return pjCan(me, pjR(me), 'clients.manage') && !ck.hasAny(['id', 'created_by']) && pjClientOk(incoming());
+    }
+    match /clients/{id} {
+      allow read: if hasPerm('projects.view');
+      allow create: if hasPerm('clients.manage') && pjClientOk(incoming());
+      allow update: if signedIn() && pjClientWrite(pjMe(), pjCk());
+      allow delete: if hasPerm('clients.manage');
+    }
+
+    // ---------------------------------------------------------------- projects
+    function pjProjectOk(d) {
+      return d.name is string && d.name.size() >= 2 && d.name.size() <= 200
+        && d.status in ['planning', 'active', 'on_hold', 'completed', 'cancelled']
+        && d.progress >= 0 && d.progress <= 100
+        && d.contract_value >= 0 && d.budget >= 0;
+    }
+    function pjProjectUpdate(me, ck) {
+      let r = pjR(me);
+      return !ck.hasAny(['id', 'created_by']) && pjProjectOk(incoming()) && (
+           (pjCan(me, r, 'projects.manage') && pjAcc(me, r, existing().id))
+           // approved site report rolls its progress onto the project (was SECURITY DEFINER)
+        || (pjCan(me, r, 'site.approve') && ck.hasOnly(['progress', 'updated_at']) && pjAcc(me, r, existing().id))
+           // ON DELETE SET NULL from a client / profile deleted in the same transaction
+        || (pjCan(me, r, 'clients.manage') && ck.hasOnly(['client_id', 'updated_at']) && incoming().client_id == null
+              && !existsAfter(path('clients', existing().client_id)))
+        || (pjCan(me, r, 'users.manage') && ck.hasOnly(['project_manager_id', 'updated_at']) && incoming().project_manager_id == null
+              && !existsAfter(path('profiles', existing().project_manager_id))));
+    }
+    match /projects/{id} {
+      allow read: if hasPerm('projects.view')
+        && (resource.data.project_manager_id == uid() || resource.data.created_by == uid() || canAccess(resource.data.id));
+      allow create: if hasPerm('projects.manage') && incoming().id == id && incoming().created_by == uid() && pjProjectOk(incoming());
+      allow update: if signedIn() && pjProjectUpdate(pjMe(), pjCk());
+      allow delete: if isSuper();
+    }
+
+    // ---------------------------------------------------------------- project members
+    // role_id / perms are a verified copy of the member's role (storage.rules may read only two documents)
+    function pjMemberDenormOk() {
+      let prof = pjAfter('profiles', incoming().user_id);
+      return incoming().role_id == prof.role_id && incoming().perms == pjAfter('roles', prof.role_id).perms;
+    }
+    function pjMemberRoleOk() {
+      return incoming().member_role in ['project_manager', 'site_engineer', 'quantity_surveyor', 'supervisor', 'storekeeper', 'member'];
+    }
+    function pjMemberCreate(me, mid) {
+      let r = pjR(me);
+      let m = incoming();
+      return mid == m.project_id + '__' + m.user_id
+        && pjCan(me, r, 'projects.manage') && pjMemberRoleOk() && pjMemberDenormOk()
+        && (pjAcc(me, r, m.project_id)
+            // the PM's own membership, written together with the project
+            || (m.member_role == 'project_manager' && pjAfter('projects', m.project_id).project_manager_id == m.user_id));
+    }
+    function pjMemberUpdate(me, ck) {
+      let r = pjR(me);
+      return !ck.hasAny(['project_id', 'user_id']) && pjMemberRoleOk() && pjMemberDenormOk() && (
+           (pjCan(me, r, 'projects.manage') && pjAcc(me, r, existing().project_id))
+           // re-sync after the user's role or the role's permissions changed
+        || (pjCan(me, r, 'users.manage') && ck.hasOnly(['role_id', 'perms'])));
+    }
+    function pjMemberDelete(me) {
+      let r = pjR(me);
+      return (pjCan(me, r, 'projects.manage') && pjAcc(me, r, existing().project_id))
+        || (pjCan(me, r, 'users.manage') && !existsAfter(path('profiles', existing().user_id)));
+    }
+    match /project_members/{mid} {
+      allow read: if canAccess(resource.data.project_id) || (isActive() && resource.data.user_id == uid());
+      allow create: if signedIn() && pjMemberCreate(pjMe(), mid);
+      allow update: if signedIn() && pjMemberUpdate(pjMe(), pjCk());
+      allow delete: if signedIn() && pjMemberDelete(pjMe());
+    }
+
+    // ---------------------------------------------------------------- BOQ
+    function pjBoqOk(d) {
+      return d.title is string && d.title.size() >= 2 && d.title.size() <= 200
+        && d.taxes is list && d.status in ['draft', 'submitted', 'approved', 'superseded'];
+    }
+    function pjBoqCreate(me) {
+      let r = pjR(me);
+      let b = incoming();
+      return pjCan(me, r, 'boq.manage') && pjAcc(me, r, b.project_id) && b.created_by == uid() && pjBoqOk(b)
+        && ((b.status != 'approved' && b.approved_by == null)
+            || (b.status == 'approved' && pjCan(me, r, 'boq.approve') && b.approved_by == uid()));
+    }
+    // approval needs boq.approve and stamps the approver; an approved BOQ is locked except "superseded"
+    function pjBoqUpdate(me, ck) {
+      let r = pjR(me);
+      let approve = pjCan(me, r, 'boq.approve');
+      return (pjCan(me, r, 'boq.manage') || approve) && pjAcc(me, r, existing().project_id)
+        && !ck.hasAny(['id', 'project_id', 'number', 'created_by']) && pjBoqOk(incoming())
+        && (existing().status == 'approved'
+            ? (approve && incoming().status == 'superseded' && ck.hasOnly(['status', 'updated_at']))
+            : (incoming().status == 'approved'
+                ? (approve && incoming().approved_by == uid() && incoming().approved_at is string)
+                : !ck.hasAny(['approved_by', 'approved_at'])));
+    }
+    function pjBoqDelete(me) {
+      let r = pjR(me);
+      return pjCan(me, r, 'boq.manage') && pjAcc(me, r, existing().project_id);
+    }
+    match /boqs/{id} {
+      allow read: if hasPerm('boq.view') && canAccess(resource.data.project_id);
+      allow create: if signedIn() && pjBoqCreate(pjMe());
+      allow update: if signedIn() && pjBoqUpdate(pjMe(), pjCk());
+      allow delete: if signedIn() && pjBoqDelete(pjMe());
+    }
+
+    // children of a BOQ: the BOQ must exist (after this write) in the same project and not be approved
+    function pjBoqOpen(bid, pid) {
+      let b = pjAfter('boqs', bid);
+      return b.project_id == pid && b.status != 'approved';
+    }
+    // deletes: also allowed while the BOQ itself is deleted in the same transaction (cascade)
+    function pjBoqOpenOrGone(bid) {
+      return !existsAfter(path('boqs', bid)) || pjAfter('boqs', bid).status != 'approved';
+    }
+    function pjSectionOk(d) {
+      return d.title is string && d.title.size() >= 1 && d.title.size() <= 200;
+    }
+    // amount = round(quantity × rate, 2) (generated column)
+    function pjItemOk(d) {
+      return d.quantity >= 0 && d.rate >= 0 && d.amount is number
+        && math.abs(d.amount - d.quantity * d.rate) < 0.01
+        && d.description is string && d.description.size() >= 1 && d.description.size() <= 1000;
+    }
+    function pjBoqChildOk(d, isItem) { return isItem ? pjItemOk(d) : pjSectionOk(d); }
+    function pjBoqChildCreate(me, isItem) {
+      let r = pjR(me);
+      let d = incoming();
+      return pjCan(me, r, 'boq.manage') && pjAcc(me, r, d.project_id) && pjBoqOpen(d.boq_id, d.project_id) && pjBoqChildOk(d, isItem);
+    }
+    // items may change section (within the same BOQ)
+    function pjBoqChildUpdate(me, ck, isItem) {
+      let r = pjR(me);
+      return pjCan(me, r, 'boq.manage') && pjAcc(me, r, existing().project_id) && !ck.hasAny(['id', 'boq_id', 'project_id'])
+        && pjBoqOpen(existing().boq_id, existing().project_id) && pjBoqChildOk(incoming(), isItem);
+    }
+    function pjBoqChildDelete(me) {
+      let r = pjR(me);
+      return pjCan(me, r, 'boq.manage') && pjAcc(me, r, existing().project_id) && pjBoqOpenOrGone(existing().boq_id);
+    }
+    match /boq_sections/{id} {
+      allow read: if hasPerm('boq.view') && canAccess(resource.data.project_id);
+      allow create: if signedIn() && pjBoqChildCreate(pjMe(), false);
+      allow update: if signedIn() && pjBoqChildUpdate(pjMe(), pjCk(), false);
+      allow delete: if signedIn() && pjBoqChildDelete(pjMe());
+    }
+    match /boq_items/{id} {
+      allow read: if hasPerm('boq.view') && canAccess(resource.data.project_id);
+      allow create: if signedIn() && pjBoqChildCreate(pjMe(), true);
+      allow update: if signedIn() && pjBoqChildUpdate(pjMe(), pjCk(), true);
+      allow delete: if signedIn() && pjBoqChildDelete(pjMe());
+    }
+
+    // ---------------------------------------------------------------- documents
+    // can_read_document(project_id, access_level) — list-query friendly form (uses the header helpers)
+    function pjDocReadable(d) {
+      return hasPerm('documents.view') && canAccess(d.project_id)
+        && (hasPerm('documents.restricted')
+            || d.access_level == 'project'
+            || (d.access_level == 'management' && hasPerm('projects.view_all')));
+    }
+    // the same for writes, with the caller's profile / role already loaded
+    function pjDocReadableR(me, r, d) {
+      return pjCan(me, r, 'documents.view') && pjAcc(me, r, d.project_id)
+        && (pjCan(me, r, 'documents.restricted')
+            || d.access_level == 'project'
+            || (d.access_level == 'management' && pjCan(me, r, 'projects.view_all')));
+    }
+    function pjDocOk(d) {
+      return d.title is string && d.title.size() >= 1 && d.title.size() <= 300
+        && d.access_level in ['project', 'management', 'restricted'] && d.tags is list
+        && d.category in ['contract', 'drawing', 'boq', 'invoice', 'receipt', 'site_report', 'permit', 'technical', 'photo', 'correspondence', 'other'];
+    }
+    function pjDocCreate(me) {
+      let r = pjR(me);
+      let d = incoming();
+      return pjCan(me, r, 'documents.manage') && pjAcc(me, r, d.project_id) && d.created_by == uid()
+        && pjDocOk(d) && d.current_version == 0 && d.current_path == null;
+    }
+    // current_* only move forward, one step per uploaded version (see document_versions create)
+    function pjDocUpdate(me, ck) {
+      let r = pjR(me);
+      return pjCan(me, r, 'documents.manage') && pjDocReadableR(me, r, existing()) && pjAcc(me, r, incoming().project_id)
+        && !ck.hasAny(['id', 'created_by']) && pjDocOk(incoming())
+        && (!ck.hasAny(['current_version', 'current_path', 'file_name', 'mime_type', 'size_bytes'])
+            || incoming().current_version == existing().current_version + 1);
+    }
+    function pjDocDelete(me) {
+      let r = pjR(me);
+      return pjCan(me, r, 'documents.manage') && pjDocReadableR(me, r, existing())
+        && (existing().created_by == uid() || pjCan(me, r, 'documents.restricted'));
+    }
+    match /documents/{id} {
+      allow read: if pjDocReadable(resource.data);
+      allow create: if signedIn() && pjDocCreate(pjMe());
+      allow update: if signedIn() && pjDocUpdate(pjMe(), pjCk());
+      allow delete: if signedIn() && pjDocDelete(pjMe());
+    }
+
+    // versions are immutable; project_id / access_level are copies of the document's (kept in sync by the engine).
+    // Created together with the document update: current_version == this version, current_path == this file.
+    function pjVersionCreate(me) {
+      let r = pjR(me);
+      let v = incoming();
+      let d = pjAfter('documents', v.document_id);
+      return pjCan(me, r, 'documents.manage') && v.uploaded_by == uid() && pjDocReadableR(me, r, d)
+        && v.project_id == d.project_id && v.access_level == d.access_level
+        && v.version == d.current_version && v.storage_path == d.current_path
+        && (v.size_bytes == null || (v.size_bytes >= 0 && v.size_bytes <= 52428800));
+    }
+    function pjVersionUpdate(me, ck) {
+      let d = pjAfter('documents', existing().document_id);
+      return pjCan(me, pjR(me), 'documents.manage') && ck.hasOnly(['project_id', 'access_level'])
+        && incoming().project_id == d.project_id && incoming().access_level == d.access_level;
+    }
+    match /document_versions/{id} {
+      allow read: if pjDocReadable(resource.data);
+      allow create: if signedIn() && pjVersionCreate(pjMe());
+      allow update: if signedIn() && pjVersionUpdate(pjMe(), pjCk());
+      allow delete: if hasPerm('documents.manage') && !existsAfter(path('documents', existing().document_id));
+    }
+
+    // ---------------------------------------------------------------- tasks
+    // tasks_before(): done ⇔ completed_at set, and done ⇒ 100 %
+    function pjTaskOk(d) {
+      return d.title is string && d.title.size() >= 2 && d.title.size() <= 300
+        && d.priority in ['low', 'medium', 'high', 'critical']
+        && d.status in ['todo', 'in_progress', 'review', 'blocked', 'done']
+        && d.progress >= 0 && d.progress <= 100
+        && (d.status == 'done' ? (d.progress == 100 && d.completed_at != null) : d.completed_at == null);
+    }
+    function pjTaskCreate(me) {
+      let r = pjR(me);
+      return pjCan(me, r, 'tasks.manage') && pjAcc(me, r, incoming().project_id) && incoming().created_by == uid() && pjTaskOk(incoming());
+    }
+    function pjTaskUpdate(me, ck) {
+      let r = pjR(me);
+      return !ck.hasAny(['id', 'created_by']) && pjTaskOk(incoming()) && (
+           (pjCan(me, r, 'tasks.manage') && pjAcc(me, r, existing().project_id) && pjAcc(me, r, incoming().project_id))
+           // the assignee works on their own task but cannot hand it over or move it
+        || (me.is_active == true && existing().assigned_to == uid() && !ck.hasAny(['assigned_to', 'project_id']))
+           // ON DELETE SET NULL from the assignee's profile being deleted
+        || (pjCan(me, r, 'users.manage') && ck.hasOnly(['assigned_to', 'updated_at']) && incoming().assigned_to == null
+              && !existsAfter(path('profiles', existing().assigned_to))));
+    }
+    function pjTaskDelete(me) {
+      let r = pjR(me);
+      return pjCan(me, r, 'tasks.manage') && pjAcc(me, r, existing().project_id);
+    }
+    match /tasks/{id} {
+      allow read: if (hasPerm('tasks.view') && canAccess(resource.data.project_id))
+        || (isActive() && resource.data.assigned_to == uid());
+      allow create: if signedIn() && pjTaskCreate(pjMe());
+      allow update: if signedIn() && pjTaskUpdate(pjMe(), pjCk());
+      allow delete: if signedIn() && pjTaskDelete(pjMe());
+    }

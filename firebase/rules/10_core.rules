@@ -1,0 +1,112 @@
+
+    // ================================================================ core (…0100_core.sql + RLS)
+    match /meta/bootstrap {
+      allow read: if signedIn();
+      allow create: if signedIn() && incoming().owner == uid() && !exists(path('meta', 'bootstrap'));
+    }
+
+    match /roles/{id} {
+      allow read: if isActive() || (hasProfile() && profile().role_id == id);
+      allow create: if hasPerm('users.manage') || bootstrapping();
+      allow update: if hasPerm('users.manage') && keeps(['key']) ;
+      allow delete: if hasPerm('users.manage') && existing().is_system != true;
+    }
+
+    match /permissions/{id} {
+      allow read: if isActive();
+      allow create: if bootstrapping();
+    }
+
+    match /role_permissions/{id} {
+      allow read: if isActive();
+      allow create: if hasPerm('users.manage') || bootstrapping();
+      allow delete: if hasPerm('users.manage');
+    }
+
+    match /profiles/{id} {
+      allow read: if (signedIn() && id == uid()) || isActive();
+      // first user (bootstrap) becomes active super admin; everyone else starts inactive as employee
+      allow create: if signedIn() && id == uid() && incoming().id == uid()
+        && ((bootstrapping() && incoming().role_id == 'super_admin' && incoming().is_active == true)
+            || (incoming().role_id == 'employee' && incoming().is_active == false));
+      allow update: if (signedIn() && id == uid() && isActive()
+                         && onlyChanges(['full_name', 'phone', 'job_title', 'avatar_url', 'last_seen_at', 'updated_at', 'username']))
+                    || (hasPerm('users.manage')
+                         && (incoming().role_id != 'super_admin' || existing().role_id == 'super_admin' || isSuper())
+                         && !(id == uid() && incoming().is_active == false));
+    }
+
+    // "sign out of all devices": the timestamp must be the server's clock (cannot be back-dated to un-revoke).
+    // Not gated by isActive(): writing it ends the writer's own session too.
+    match /session_revocations/{id} {
+      allow read: if signedIn() && (id == uid() || hasPerm('users.manage'));
+      allow create, update: if signedIn() && (id == uid() || hasPerm('users.manage'))
+        && incoming().user_id == id && incoming().at == request.time
+        && incoming().keys().hasOnly(['user_id', 'at']);
+    }
+
+    // username -> email lookup for "sign in with username". Readable one document at a time without
+    // signing in (exact username needed; listing is denied). Email must match the account's profile.
+    match /usernames/{name} {
+      allow get: if true;
+      allow list: if false;
+      allow create: if signedIn() && !exists(path('usernames', name)) && incoming().username == name
+        && (incoming().user_id == uid() || hasPerm('users.manage'))
+        && incoming().email == getAfter(path('profiles', incoming().user_id)).data.email;
+      allow update: if (existing().user_id == uid() || hasPerm('users.manage')) && onlyChanges(['email'])
+        && incoming().email == getAfter(path('profiles', existing().user_id)).data.email;
+      allow delete: if signedIn() && (existing().user_id == uid() || hasPerm('users.manage'));
+    }
+
+    match /company_settings/{id} {
+      allow read: if signedIn();
+      allow create: if bootstrapping();
+      allow update: if hasPerm('settings.manage');
+    }
+
+    match /numbering_sequences/{key} {
+      allow read: if isActive();
+      allow create: if bootstrapping();
+      // any active user may take the next number(s) (was a SECURITY DEFINER function);
+      // only settings.manage may change prefixes/padding or reset counters
+      allow update: if hasPerm('settings.manage')
+        || (isActive() && onlyChanges(['next_value'])
+            && incoming().next_value > existing().next_value
+            && incoming().next_value <= existing().next_value + 500);  // bulk inserts take several numbers
+    }
+
+    match /audit_logs/{id} {
+      allow read: if hasPerm('audit.view');
+      allow create: if isActive() && incoming().changed_by == uid();
+    }
+
+    match /notifications/{id} {
+      allow read: if signedIn() && existing().user_id == uid();
+      // written by the app's server-side-equivalent hooks for any user (approvals, assignments, alerts)
+      allow create: if isActive();
+      allow update: if signedIn() && existing().user_id == uid() && onlyChanges(['is_read']);
+      allow delete: if signedIn() && existing().user_id == uid();
+    }
+
+    // reports to the admin (src/shared/userReports.ts): any active user sends one as themself; the reporter reads
+    // their own and may only close it; administrators (users.manage) read all, reply and set the status.
+    function userReportValid(r) {
+      return r.subject is string && r.subject.size() > 0 && r.subject.size() <= 200
+        && r.body is string && r.body.size() > 0 && r.body.size() <= 5000
+        && r.category in ['problem', 'request', 'complaint', 'safety', 'idea', 'other']
+        && r.priority in ['low', 'normal', 'high', 'urgent']
+        && (r.get('page', null) == null || (r.page is string && r.page.size() <= 300));
+    }
+    match /user_reports/{id} {
+      allow read: if hasPerm('users.manage') || (isActive() && existing().reporter_id == uid());
+      allow create: if isActive() && incoming().reporter_id == uid() && incoming().status == 'open'
+        && userReportValid(incoming())
+        && incoming().get('admin_reply', null) == null && incoming().get('handled_by', null) == null;
+      allow update: if (hasPerm('users.manage')
+          && keeps(['reporter_id', 'category', 'priority', 'subject', 'body', 'page', 'created_at'])
+          && incoming().status in ['open', 'in_review', 'resolved', 'closed']
+          && incoming().handled_by == uid()
+          && (incoming().get('admin_reply', null) == null || (incoming().admin_reply is string && incoming().admin_reply.size() <= 5000)))
+        || (isActive() && existing().reporter_id == uid() && onlyChanges(['status', 'updated_at']) && incoming().status == 'closed');
+      allow delete: if hasPerm('users.manage');
+    }

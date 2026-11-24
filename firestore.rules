@@ -1,0 +1,1030 @@
+rules_version = '2';
+
+// =============================================================================
+// ABCkit — Firestore security rules (the enforcement layer that replaced PostgreSQL RLS)
+// GENERATED: edit the fragments in firebase/rules/*.rules, then run `npm run rules:build`.
+//
+// Data model: one collection per former SQL table, document id = primary key
+// (composite keys joined with "__", e.g. project_members/{projectId}__{userId}).
+// profiles/{uid}.role_id -> roles/{roleId}; roles/{roleId}.perms = permission keys.
+// =============================================================================
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------------------------------------------------------- identity
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function path(coll, id) { return /databases/$(database)/documents/$(coll)/$(id); }
+    function profile() { return get(path('profiles', uid())).data; }
+    function hasProfile() { return signedIn() && exists(path('profiles', uid())); }
+    // Server-side session checks (Firebase ID tokens carry auth_time = when the user signed in):
+    //  - absolute session lifetime: 30 days after sign-in the user must sign in again
+    //  - "sign out of all devices" / admin "force sign-out": session_revocations/{uid}.at (server timestamp)
+    //    invalidates every token issued before it
+    function sessionValid() {
+      let signedInAt = request.auth.token.auth_time * 1000;
+      let rev = path('session_revocations', uid());
+      return request.time.toMillis() < signedInAt + 2592000000
+        && (!exists(rev) || signedInAt > get(rev).data.at.toMillis());
+    }
+    function isActive() { return hasProfile() && profile().is_active == true && sessionValid(); }
+    function role() { return get(path('roles', profile().role_id)).data; }
+    function isSuper() { return isActive() && role().key == 'super_admin'; }
+    function hasPerm(p) { return isActive() && (role().key == 'super_admin' || p in role().perms); }
+    function hasAnyPerm(ps) { return isActive() && (role().key == 'super_admin' || role().perms.hasAny(ps)); }
+
+    // ---------------------------------------------------------------- projects
+    // company-wide viewers, the project manager, or listed members (project_members/{pid}__{uid})
+    function canAccess(pid) {
+      return pid == null
+        || hasPerm('projects.view_all')
+        || (isActive() && exists(path('project_members', pid + '__' + uid())))
+        || (isActive() && get(path('projects', pid)).data.project_manager_id == uid());
+    }
+
+    // ---------------------------------------------------------------- write helpers
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function changedKeys() { return request.resource.data.diff(resource.data).affectedKeys(); }
+    function onlyChanges(keys) { return changedKeys().hasOnly(keys); }
+    function keeps(keys) { return !changedKeys().hasAny(keys); }
+    function bootstrapping() {
+      return signedIn()
+        && !exists(path('meta', 'bootstrap'))
+        && getAfter(path('meta', 'bootstrap')).data.owner == uid();
+    }
+
+    // ================================================================ core (…0100_core.sql + RLS)
+    match /meta/bootstrap {
+      allow read: if signedIn();
+      allow create: if signedIn() && incoming().owner == uid() && !exists(path('meta', 'bootstrap'));
+    }
+
+    match /roles/{id} {
+      allow read: if isActive() || (hasProfile() && profile().role_id == id);
+      allow create: if hasPerm('users.manage') || bootstrapping();
+      allow update: if hasPerm('users.manage') && keeps(['key']) ;
+      allow delete: if hasPerm('users.manage') && existing().is_system != true;
+    }
+
+    match /permissions/{id} {
+      allow read: if isActive();
+      allow create: if bootstrapping();
+    }
+
+    match /role_permissions/{id} {
+      allow read: if isActive();
+      allow create: if hasPerm('users.manage') || bootstrapping();
+      allow delete: if hasPerm('users.manage');
+    }
+
+    match /profiles/{id} {
+      allow read: if (signedIn() && id == uid()) || isActive();
+      // first user (bootstrap) becomes active super admin; everyone else starts inactive as employee
+      allow create: if signedIn() && id == uid() && incoming().id == uid()
+        && ((bootstrapping() && incoming().role_id == 'super_admin' && incoming().is_active == true)
+            || (incoming().role_id == 'employee' && incoming().is_active == false));
+      allow update: if (signedIn() && id == uid() && isActive()
+                         && onlyChanges(['full_name', 'phone', 'job_title', 'avatar_url', 'last_seen_at', 'updated_at', 'username']))
+                    || (hasPerm('users.manage')
+                         && (incoming().role_id != 'super_admin' || existing().role_id == 'super_admin' || isSuper())
+                         && !(id == uid() && incoming().is_active == false));
+    }
+
+    // "sign out of all devices": the timestamp must be the server's clock (cannot be back-dated to un-revoke).
+    // Not gated by isActive(): writing it ends the writer's own session too.
+    match /session_revocations/{id} {
+      allow read: if signedIn() && (id == uid() || hasPerm('users.manage'));
+      allow create, update: if signedIn() && (id == uid() || hasPerm('users.manage'))
+        && incoming().user_id == id && incoming().at == request.time
+        && incoming().keys().hasOnly(['user_id', 'at']);
+    }
+
+    // username -> email lookup for "sign in with username". Readable one document at a time without
+    // signing in (exact username needed; listing is denied). Email must match the account's profile.
+    match /usernames/{name} {
+      allow get: if true;
+      allow list: if false;
+      allow create: if signedIn() && !exists(path('usernames', name)) && incoming().username == name
+        && (incoming().user_id == uid() || hasPerm('users.manage'))
+        && incoming().email == getAfter(path('profiles', incoming().user_id)).data.email;
+      allow update: if (existing().user_id == uid() || hasPerm('users.manage')) && onlyChanges(['email'])
+        && incoming().email == getAfter(path('profiles', existing().user_id)).data.email;
+      allow delete: if signedIn() && (existing().user_id == uid() || hasPerm('users.manage'));
+    }
+
+    match /company_settings/{id} {
+      allow read: if signedIn();
+      allow create: if bootstrapping();
+      allow update: if hasPerm('settings.manage');
+    }
+
+    match /numbering_sequences/{key} {
+      allow read: if isActive();
+      allow create: if bootstrapping();
+      // any active user may take the next number(s) (was a SECURITY DEFINER function);
+      // only settings.manage may change prefixes/padding or reset counters
+      allow update: if hasPerm('settings.manage')
+        || (isActive() && onlyChanges(['next_value'])
+            && incoming().next_value > existing().next_value
+            && incoming().next_value <= existing().next_value + 500);  // bulk inserts take several numbers
+    }
+
+    match /audit_logs/{id} {
+      allow read: if hasPerm('audit.view');
+      allow create: if isActive() && incoming().changed_by == uid();
+    }
+
+    match /notifications/{id} {
+      allow read: if signedIn() && existing().user_id == uid();
+      // written by the app's server-side-equivalent hooks for any user (approvals, assignments, alerts)
+      allow create: if isActive();
+      allow update: if signedIn() && existing().user_id == uid() && onlyChanges(['is_read']);
+      allow delete: if signedIn() && existing().user_id == uid();
+    }
+
+    // reports to the admin (src/shared/userReports.ts): any active user sends one as themself; the reporter reads
+    // their own and may only close it; administrators (users.manage) read all, reply and set the status.
+    function userReportValid(r) {
+      return r.subject is string && r.subject.size() > 0 && r.subject.size() <= 200
+        && r.body is string && r.body.size() > 0 && r.body.size() <= 5000
+        && r.category in ['problem', 'request', 'complaint', 'safety', 'idea', 'other']
+        && r.priority in ['low', 'normal', 'high', 'urgent']
+        && (r.get('page', null) == null || (r.page is string && r.page.size() <= 300));
+    }
+    match /user_reports/{id} {
+      allow read: if hasPerm('users.manage') || (isActive() && existing().reporter_id == uid());
+      allow create: if isActive() && incoming().reporter_id == uid() && incoming().status == 'open'
+        && userReportValid(incoming())
+        && incoming().get('admin_reply', null) == null && incoming().get('handled_by', null) == null;
+      allow update: if (hasPerm('users.manage')
+          && keeps(['reporter_id', 'category', 'priority', 'subject', 'body', 'page', 'created_at'])
+          && incoming().status in ['open', 'in_review', 'resolved', 'closed']
+          && incoming().handled_by == uid()
+          && (incoming().get('admin_reply', null) == null || (incoming().admin_reply is string && incoming().admin_reply.size() <= 5000)))
+        || (isActive() && existing().reporter_id == uid() && onlyChanges(['status', 'updated_at']) && incoming().status == 'closed');
+      allow delete: if hasPerm('users.manage');
+    }
+
+    // ================================================================ projects, BOQ, documents, tasks
+    // (…0200_projects_boq.sql, documents / tasks of …0400, RLS in …0500; hooks: src/backend/domains/projects.ts)
+    // List queries the engine issues (scopes in projects.ts):
+    //   company-wide users: unconstrained; others: project_id == pid per accessible project
+    //   (+ project_id == null for tasks / documents), plus
+    //   projects:  id == pid, project_manager_id == uid, created_by == uid
+    //   project_members: user_id == uid;  tasks: assigned_to == uid
+    //   documents / document_versions: additionally access_level == 'project' | 'management'
+    //   unless the caller holds documents.restricted.
+    // boq_sections / boq_items / document_versions carry project_id (and access_level) copied from their
+    // parent by the engine (defineInherit), so reads never need the parent document.
+    //
+    // Write rules load the caller's profile / role and the changed-key set once and pass them down
+    // (pjMe / pjR / ck): re-evaluating hasPerm() and diff() in every branch exceeds the
+    // 1000-expressions-per-write limit on wide documents.
+
+    function pjAfter(coll, id) { return getAfter(path(coll, id)).data; }
+    function pjMe() { return get(path('profiles', uid())).data; }
+    function pjR(me) { return get(path('roles', me.role_id)).data; }
+    function pjCan(me, r, p) { return me.is_active == true && (r.key == 'super_admin' || p in r.perms); }
+    function pjAcc(me, r, pid) {
+      return pid == null
+        || pjCan(me, r, 'projects.view_all')
+        || (me.is_active == true
+            && (exists(path('project_members', pid + '__' + uid()))
+                || get(path('projects', pid)).data.project_manager_id == uid()));
+    }
+    function pjCk() { return request.resource.data.diff(resource.data).affectedKeys(); }
+
+    // ---------------------------------------------------------------- clients
+    function pjClientOk(d) {
+      return d.name is string && d.name.size() >= 1 && d.name.size() <= 200
+        && d.client_type in ['company', 'government', 'individual', 'ngo'];
+    }
+    function pjClientWrite(me, ck) {
+      return pjCan(me, pjR(me), 'clients.manage') && !ck.hasAny(['id', 'created_by']) && pjClientOk(incoming());
+    }
+    match /clients/{id} {
+      allow read: if hasPerm('projects.view');
+      allow create: if hasPerm('clients.manage') && pjClientOk(incoming());
+      allow update: if signedIn() && pjClientWrite(pjMe(), pjCk());
+      allow delete: if hasPerm('clients.manage');
+    }
+
+    // ---------------------------------------------------------------- projects
+    function pjProjectOk(d) {
+      return d.name is string && d.name.size() >= 2 && d.name.size() <= 200
+        && d.status in ['planning', 'active', 'on_hold', 'completed', 'cancelled']
+        && d.progress >= 0 && d.progress <= 100
+        && d.contract_value >= 0 && d.budget >= 0;
+    }
+    function pjProjectUpdate(me, ck) {
+      let r = pjR(me);
+      return !ck.hasAny(['id', 'created_by']) && pjProjectOk(incoming()) && (
+           (pjCan(me, r, 'projects.manage') && pjAcc(me, r, existing().id))
+           // approved site report rolls its progress onto the project (was SECURITY DEFINER)
+        || (pjCan(me, r, 'site.approve') && ck.hasOnly(['progress', 'updated_at']) && pjAcc(me, r, existing().id))
+           // ON DELETE SET NULL from a client / profile deleted in the same transaction
+        || (pjCan(me, r, 'clients.manage') && ck.hasOnly(['client_id', 'updated_at']) && incoming().client_id == null
+              && !existsAfter(path('clients', existing().client_id)))
+        || (pjCan(me, r, 'users.manage') && ck.hasOnly(['project_manager_id', 'updated_at']) && incoming().project_manager_id == null
+              && !existsAfter(path('profiles', existing().project_manager_id))));
+    }
+    match /projects/{id} {
+      allow read: if hasPerm('projects.view')
+        && (resource.data.project_manager_id == uid() || resource.data.created_by == uid() || canAccess(resource.data.id));
+      allow create: if hasPerm('projects.manage') && incoming().id == id && incoming().created_by == uid() && pjProjectOk(incoming());
+      allow update: if signedIn() && pjProjectUpdate(pjMe(), pjCk());
+      allow delete: if isSuper();
+    }
+
+    // ---------------------------------------------------------------- project members
+    // role_id / perms are a verified copy of the member's role (storage.rules may read only two documents)
+    function pjMemberDenormOk() {
+      let prof = pjAfter('profiles', incoming().user_id);
+      return incoming().role_id == prof.role_id && incoming().perms == pjAfter('roles', prof.role_id).perms;
+    }
+    function pjMemberRoleOk() {
+      return incoming().member_role in ['project_manager', 'site_engineer', 'quantity_surveyor', 'supervisor', 'storekeeper', 'member'];
+    }
+    function pjMemberCreate(me, mid) {
+      let r = pjR(me);
+      let m = incoming();
+      return mid == m.project_id + '__' + m.user_id
+        && pjCan(me, r, 'projects.manage') && pjMemberRoleOk() && pjMemberDenormOk()
+        && (pjAcc(me, r, m.project_id)
+            // the PM's own membership, written together with the project
+            || (m.member_role == 'project_manager' && pjAfter('projects', m.project_id).project_manager_id == m.user_id));
+    }
+    function pjMemberUpdate(me, ck) {
+      let r = pjR(me);
+      return !ck.hasAny(['project_id', 'user_id']) && pjMemberRoleOk() && pjMemberDenormOk() && (
+           (pjCan(me, r, 'projects.manage') && pjAcc(me, r, existing().project_id))
+           // re-sync after the user's role or the role's permissions changed
+        || (pjCan(me, r, 'users.manage') && ck.hasOnly(['role_id', 'perms'])));
+    }
+    function pjMemberDelete(me) {
+      let r = pjR(me);
+      return (pjCan(me, r, 'projects.manage') && pjAcc(me, r, existing().project_id))
+        || (pjCan(me, r, 'users.manage') && !existsAfter(path('profiles', existing().user_id)));
+    }
+    match /project_members/{mid} {
+      allow read: if canAccess(resource.data.project_id) || (isActive() && resource.data.user_id == uid());
+      allow create: if signedIn() && pjMemberCreate(pjMe(), mid);
+      allow update: if signedIn() && pjMemberUpdate(pjMe(), pjCk());
+      allow delete: if signedIn() && pjMemberDelete(pjMe());
+    }
+
+    // ---------------------------------------------------------------- BOQ
+    function pjBoqOk(d) {
+      return d.title is string && d.title.size() >= 2 && d.title.size() <= 200
+        && d.taxes is list && d.status in ['draft', 'submitted', 'approved', 'superseded'];
+    }
+    function pjBoqCreate(me) {
+      let r = pjR(me);
+      let b = incoming();
+      return pjCan(me, r, 'boq.manage') && pjAcc(me, r, b.project_id) && b.created_by == uid() && pjBoqOk(b)
+        && ((b.status != 'approved' && b.approved_by == null)
+            || (b.status == 'approved' && pjCan(me, r, 'boq.approve') && b.approved_by == uid()));
+    }
+    // approval needs boq.approve and stamps the approver; an approved BOQ is locked except "superseded"
+    function pjBoqUpdate(me, ck) {
+      let r = pjR(me);
+      let approve = pjCan(me, r, 'boq.approve');
+      return (pjCan(me, r, 'boq.manage') || approve) && pjAcc(me, r, existing().project_id)
+        && !ck.hasAny(['id', 'project_id', 'number', 'created_by']) && pjBoqOk(incoming())
+        && (existing().status == 'approved'
+            ? (approve && incoming().status == 'superseded' && ck.hasOnly(['status', 'updated_at']))
+            : (incoming().status == 'approved'
+                ? (approve && incoming().approved_by == uid() && incoming().approved_at is string)
+                : !ck.hasAny(['approved_by', 'approved_at'])));
+    }
+    function pjBoqDelete(me) {
+      let r = pjR(me);
+      return pjCan(me, r, 'boq.manage') && pjAcc(me, r, existing().project_id);
+    }
+    match /boqs/{id} {
+      allow read: if hasPerm('boq.view') && canAccess(resource.data.project_id);
+      allow create: if signedIn() && pjBoqCreate(pjMe());
+      allow update: if signedIn() && pjBoqUpdate(pjMe(), pjCk());
+      allow delete: if signedIn() && pjBoqDelete(pjMe());
+    }
+
+    // children of a BOQ: the BOQ must exist (after this write) in the same project and not be approved
+    function pjBoqOpen(bid, pid) {
+      let b = pjAfter('boqs', bid);
+      return b.project_id == pid && b.status != 'approved';
+    }
+    // deletes: also allowed while the BOQ itself is deleted in the same transaction (cascade)
+    function pjBoqOpenOrGone(bid) {
+      return !existsAfter(path('boqs', bid)) || pjAfter('boqs', bid).status != 'approved';
+    }
+    function pjSectionOk(d) {
+      return d.title is string && d.title.size() >= 1 && d.title.size() <= 200;
+    }
+    // amount = round(quantity × rate, 2) (generated column)
+    function pjItemOk(d) {
+      return d.quantity >= 0 && d.rate >= 0 && d.amount is number
+        && math.abs(d.amount - d.quantity * d.rate) < 0.01
+        && d.description is string && d.description.size() >= 1 && d.description.size() <= 1000;
+    }
+    function pjBoqChildOk(d, isItem) { return isItem ? pjItemOk(d) : pjSectionOk(d); }
+    function pjBoqChildCreate(me, isItem) {
+      let r = pjR(me);
+      let d = incoming();
+      return pjCan(me, r, 'boq.manage') && pjAcc(me, r, d.project_id) && pjBoqOpen(d.boq_id, d.project_id) && pjBoqChildOk(d, isItem);
+    }
+    // items may change section (within the same BOQ)
+    function pjBoqChildUpdate(me, ck, isItem) {
+      let r = pjR(me);
+      return pjCan(me, r, 'boq.manage') && pjAcc(me, r, existing().project_id) && !ck.hasAny(['id', 'boq_id', 'project_id'])
+        && pjBoqOpen(existing().boq_id, existing().project_id) && pjBoqChildOk(incoming(), isItem);
+    }
+    function pjBoqChildDelete(me) {
+      let r = pjR(me);
+      return pjCan(me, r, 'boq.manage') && pjAcc(me, r, existing().project_id) && pjBoqOpenOrGone(existing().boq_id);
+    }
+    match /boq_sections/{id} {
+      allow read: if hasPerm('boq.view') && canAccess(resource.data.project_id);
+      allow create: if signedIn() && pjBoqChildCreate(pjMe(), false);
+      allow update: if signedIn() && pjBoqChildUpdate(pjMe(), pjCk(), false);
+      allow delete: if signedIn() && pjBoqChildDelete(pjMe());
+    }
+    match /boq_items/{id} {
+      allow read: if hasPerm('boq.view') && canAccess(resource.data.project_id);
+      allow create: if signedIn() && pjBoqChildCreate(pjMe(), true);
+      allow update: if signedIn() && pjBoqChildUpdate(pjMe(), pjCk(), true);
+      allow delete: if signedIn() && pjBoqChildDelete(pjMe());
+    }
+
+    // ---------------------------------------------------------------- documents
+    // can_read_document(project_id, access_level) — list-query friendly form (uses the header helpers)
+    function pjDocReadable(d) {
+      return hasPerm('documents.view') && canAccess(d.project_id)
+        && (hasPerm('documents.restricted')
+            || d.access_level == 'project'
+            || (d.access_level == 'management' && hasPerm('projects.view_all')));
+    }
+    // the same for writes, with the caller's profile / role already loaded
+    function pjDocReadableR(me, r, d) {
+      return pjCan(me, r, 'documents.view') && pjAcc(me, r, d.project_id)
+        && (pjCan(me, r, 'documents.restricted')
+            || d.access_level == 'project'
+            || (d.access_level == 'management' && pjCan(me, r, 'projects.view_all')));
+    }
+    function pjDocOk(d) {
+      return d.title is string && d.title.size() >= 1 && d.title.size() <= 300
+        && d.access_level in ['project', 'management', 'restricted'] && d.tags is list
+        && d.category in ['contract', 'drawing', 'boq', 'invoice', 'receipt', 'site_report', 'permit', 'technical', 'photo', 'correspondence', 'other'];
+    }
+    function pjDocCreate(me) {
+      let r = pjR(me);
+      let d = incoming();
+      return pjCan(me, r, 'documents.manage') && pjAcc(me, r, d.project_id) && d.created_by == uid()
+        && pjDocOk(d) && d.current_version == 0 && d.current_path == null;
+    }
+    // current_* only move forward, one step per uploaded version (see document_versions create)
+    function pjDocUpdate(me, ck) {
+      let r = pjR(me);
+      return pjCan(me, r, 'documents.manage') && pjDocReadableR(me, r, existing()) && pjAcc(me, r, incoming().project_id)
+        && !ck.hasAny(['id', 'created_by']) && pjDocOk(incoming())
+        && (!ck.hasAny(['current_version', 'current_path', 'file_name', 'mime_type', 'size_bytes'])
+            || incoming().current_version == existing().current_version + 1);
+    }
+    function pjDocDelete(me) {
+      let r = pjR(me);
+      return pjCan(me, r, 'documents.manage') && pjDocReadableR(me, r, existing())
+        && (existing().created_by == uid() || pjCan(me, r, 'documents.restricted'));
+    }
+    match /documents/{id} {
+      allow read: if pjDocReadable(resource.data);
+      allow create: if signedIn() && pjDocCreate(pjMe());
+      allow update: if signedIn() && pjDocUpdate(pjMe(), pjCk());
+      allow delete: if signedIn() && pjDocDelete(pjMe());
+    }
+
+    // versions are immutable; project_id / access_level are copies of the document's (kept in sync by the engine).
+    // Created together with the document update: current_version == this version, current_path == this file.
+    function pjVersionCreate(me) {
+      let r = pjR(me);
+      let v = incoming();
+      let d = pjAfter('documents', v.document_id);
+      return pjCan(me, r, 'documents.manage') && v.uploaded_by == uid() && pjDocReadableR(me, r, d)
+        && v.project_id == d.project_id && v.access_level == d.access_level
+        && v.version == d.current_version && v.storage_path == d.current_path
+        && (v.size_bytes == null || (v.size_bytes >= 0 && v.size_bytes <= 52428800));
+    }
+    function pjVersionUpdate(me, ck) {
+      let d = pjAfter('documents', existing().document_id);
+      return pjCan(me, pjR(me), 'documents.manage') && ck.hasOnly(['project_id', 'access_level'])
+        && incoming().project_id == d.project_id && incoming().access_level == d.access_level;
+    }
+    match /document_versions/{id} {
+      allow read: if pjDocReadable(resource.data);
+      allow create: if signedIn() && pjVersionCreate(pjMe());
+      allow update: if signedIn() && pjVersionUpdate(pjMe(), pjCk());
+      allow delete: if hasPerm('documents.manage') && !existsAfter(path('documents', existing().document_id));
+    }
+
+    // ---------------------------------------------------------------- tasks
+    // tasks_before(): done ⇔ completed_at set, and done ⇒ 100 %
+    function pjTaskOk(d) {
+      return d.title is string && d.title.size() >= 2 && d.title.size() <= 300
+        && d.priority in ['low', 'medium', 'high', 'critical']
+        && d.status in ['todo', 'in_progress', 'review', 'blocked', 'done']
+        && d.progress >= 0 && d.progress <= 100
+        && (d.status == 'done' ? (d.progress == 100 && d.completed_at != null) : d.completed_at == null);
+    }
+    function pjTaskCreate(me) {
+      let r = pjR(me);
+      return pjCan(me, r, 'tasks.manage') && pjAcc(me, r, incoming().project_id) && incoming().created_by == uid() && pjTaskOk(incoming());
+    }
+    function pjTaskUpdate(me, ck) {
+      let r = pjR(me);
+      return !ck.hasAny(['id', 'created_by']) && pjTaskOk(incoming()) && (
+           (pjCan(me, r, 'tasks.manage') && pjAcc(me, r, existing().project_id) && pjAcc(me, r, incoming().project_id))
+           // the assignee works on their own task but cannot hand it over or move it
+        || (me.is_active == true && existing().assigned_to == uid() && !ck.hasAny(['assigned_to', 'project_id']))
+           // ON DELETE SET NULL from the assignee's profile being deleted
+        || (pjCan(me, r, 'users.manage') && ck.hasOnly(['assigned_to', 'updated_at']) && incoming().assigned_to == null
+              && !existsAfter(path('profiles', existing().assigned_to))));
+    }
+    function pjTaskDelete(me) {
+      let r = pjR(me);
+      return pjCan(me, r, 'tasks.manage') && pjAcc(me, r, existing().project_id);
+    }
+    match /tasks/{id} {
+      allow read: if (hasPerm('tasks.view') && canAccess(resource.data.project_id))
+        || (isActive() && resource.data.assigned_to == uid());
+      allow create: if signedIn() && pjTaskCreate(pjMe());
+      allow update: if signedIn() && pjTaskUpdate(pjMe(), pjCk());
+      allow delete: if signedIn() && pjTaskDelete(pjMe());
+    }
+
+    // ================================================================ operations (…0300_operations.sql + RLS)
+    // Site reports, inventory ledger, procurement, equipment.
+    // Query shapes issued by the engine (see src/backend/domains/operations.ts scopes):
+    //   company-wide users: unconstrained; others: project_id == pid per project (+ project_id == null for
+    //   nullable columns) and, for purchase requests/items, requested_by == uid.
+    // Child tables carry a denormalised project_id (and requested_by / engineer_id) copied from the parent.
+    // Trigger checks that matter for security are re-stated here; SECURITY DEFINER side effects
+    // (stock balance, PO received quantities, equipment meter) are allowed only in verified shapes.
+
+    function isInbound(t) { return t in ['receipt', 'return', 'adjustment_in', 'opening']; }
+    function near(a, b) { return a - b < 0.0005 && b - a < 0.0005; }
+    // a project row was deleted by a super admin: FK "on delete set null" on project_id
+    function projectSetNull() {
+      return isSuper() && onlyChanges(['project_id', 'updated_at']) && incoming().project_id == null;
+    }
+
+    // ---------------------------------------------------------------- site reports
+    match /site_reports/{id} {
+      function srDecisionOk() {
+        return ((incoming().status == existing().status || !(incoming().status in ['approved', 'rejected']))
+                  && keeps(['approved_by', 'approved_at']))
+          || (incoming().status in ['approved', 'rejected'] && incoming().status != existing().status
+                  && hasPerm('site.approve') && incoming().approved_by == uid());
+      }
+      allow read: if hasPerm('site.view') && canAccess(resource.data.project_id);
+      allow create: if hasPerm('site.report')
+        && incoming().engineer_id == uid()
+        && canAccess(incoming().project_id)
+        && incoming().status in ['draft', 'submitted']
+        && incoming().approved_by == null
+        && (incoming().client_uuid == null || incoming().client_uuid == id);
+      allow update: if keeps(['number', 'client_uuid', 'created_at']) && srDecisionOk() && (
+          // engineers edit their own reports until approved (site_reports_update_own)
+          (existing().engineer_id == uid() && existing().status in ['draft', 'rejected', 'submitted']
+             && hasPerm('site.report') && incoming().engineer_id == uid() && canAccess(incoming().project_id))
+          // approvers review (site_reports_review)
+          || (hasPerm('site.approve') && canAccess(existing().project_id) && canAccess(incoming().project_id))
+        );
+      allow delete: if (existing().engineer_id == uid() && existing().status == 'draft') || isSuper();
+    }
+
+    match /site_report_photos/{id} {
+      function parentReport() { return getAfter(path('site_reports', incoming().report_id)).data; }
+      allow read: if hasPerm('site.view') && canAccess(resource.data.project_id);
+      allow create: if (incoming().engineer_id == uid() || hasPerm('site.approve'))
+        && incoming().created_by == uid()
+        && canAccess(incoming().project_id)
+        && parentReport().project_id == incoming().project_id
+        && parentReport().engineer_id == incoming().engineer_id;
+      // only the engine's sync of the inherited fields when the report changes
+      allow update: if onlyChanges(['project_id', 'engineer_id'])
+        && incoming().project_id == parentReport().project_id
+        && incoming().engineer_id == parentReport().engineer_id;
+      allow delete: if existing().created_by == uid() || hasPerm('site.approve');
+    }
+
+    match /safety_incidents/{id} {
+      allow read: if hasPerm('site.view') && canAccess(resource.data.project_id);
+      allow create: if hasPerm('site.report') && canAccess(incoming().project_id);
+      allow update: if hasPerm('site.report') && canAccess(existing().project_id) && canAccess(incoming().project_id);
+      allow delete: if hasPerm('site.report') && canAccess(existing().project_id);
+    }
+
+    // ---------------------------------------------------------------- materials & stock ledger
+    match /material_categories/{id} {
+      allow read: if isActive();
+      // the first user's sign-in seeds the default categories
+      allow create: if hasPerm('inventory.manage') || bootstrapping();
+      allow update, delete: if hasPerm('inventory.manage');
+    }
+
+    match /materials/{id} {
+      // the balance moves only together with a new ledger row created in the same transaction
+      function ledgerPosting() {
+        let t = getAfter(path('inventory_transactions', incoming().last_txn_id)).data;
+        return incoming().last_txn_id is string
+          && incoming().last_txn_id != existing().get('last_txn_id', null)
+          && !exists(path('inventory_transactions', incoming().last_txn_id))
+          && t.material_id == id
+          && t.balance_after == incoming().current_stock
+          && (incoming().unit_price == existing().unit_price
+              || (t.txn_type == 'receipt' && incoming().unit_price == t.unit_price))
+          && onlyChanges(['current_stock', 'unit_price', 'last_txn_id', 'updated_at']);
+      }
+      allow read: if hasAnyPerm(['inventory.view', 'procurement.view', 'site.report']);
+      allow create: if hasAnyPerm(['inventory.manage', 'procurement.manage'])
+        && incoming().current_stock == 0 && incoming().get('last_txn_id', null) == null;
+      allow update: if (hasAnyPerm(['inventory.manage', 'procurement.manage']) && keeps(['current_stock', 'last_txn_id']))
+        || ledgerPosting();
+      allow delete: if hasAnyPerm(['inventory.manage', 'procurement.manage']);
+    }
+
+    match /inventory_transactions/{id} {
+      function balanceOk() {
+        let t = incoming();
+        let before = get(path('materials', t.material_id)).data;
+        let after = getAfter(path('materials', t.material_id)).data;
+        return after.get('last_txn_id', null) == id
+          && after.current_stock == t.balance_after
+          && near(before.current_stock + (isInbound(t.txn_type) ? t.quantity : -t.quantity), t.balance_after)
+          && ((t.balance_after >= 0 && t.approved_by == null)
+              || (t.balance_after < 0 && t.negative_override == true
+                  && hasPerm('inventory.approve_negative') && t.approved_by == uid()));
+      }
+      // stock receipt posted by a goods-received line in the same transaction (id = GRN line id)
+      function grnPosting() {
+        let g = getAfter(path('goods_received_items', id)).data;
+        return incoming().grn_item_id == id
+          && !exists(path('goods_received_items', id))
+          && incoming().txn_type == 'receipt'
+          && g.material_id == incoming().material_id
+          && g.quantity_received == incoming().quantity
+          && hasAnyPerm(['procurement.manage', 'inventory.manage']);
+      }
+      allow read: if hasPerm('inventory.view') && canAccess(resource.data.project_id);
+      allow create: if isActive()
+        && incoming().created_by == uid()
+        && incoming().quantity > 0
+        && incoming().txn_type in ['receipt', 'issue', 'return', 'adjustment_in', 'adjustment_out', 'opening']
+        && (!(incoming().txn_type in ['adjustment_in', 'adjustment_out']) || hasPerm('inventory.adjust'))
+        && balanceOk()
+        && ((incoming().grn_item_id == null
+              && hasAnyPerm(['inventory.manage', 'inventory.approve_negative'])
+              && canAccess(incoming().project_id))
+            || grnPosting());
+      // ledger rows are immutable: corrections are posted as adjustments
+      allow update, delete: if false;
+    }
+
+    // ---------------------------------------------------------------- procurement
+    match /suppliers/{id} {
+      allow read: if hasAnyPerm(['procurement.view', 'finance.view']);
+      allow write: if hasPerm('procurement.manage');
+    }
+
+    match /purchase_requests/{id} {
+      function prDecisionOk() {
+        return ((incoming().status == existing().status || !(incoming().status in ['approved', 'rejected']))
+                  && keeps(['approved_by', 'approved_at']))
+          || (incoming().status in ['approved', 'rejected'] && incoming().status != existing().status
+                  && hasPerm('procurement.approve') && incoming().approved_by == uid());
+      }
+      allow read: if (hasPerm('procurement.view') && canAccess(resource.data.project_id))
+        || (isActive() && resource.data.requested_by == uid());
+      allow create: if hasPerm('procurement.request')
+        && canAccess(incoming().project_id)
+        && incoming().requested_by == uid()
+        && incoming().status in ['draft', 'submitted']
+        && incoming().approved_by == null;
+      allow update: if keeps(['number', 'created_at']) && prDecisionOk() && (
+          (isActive() && existing().requested_by == uid() && existing().status in ['draft', 'submitted', 'rejected']
+             && incoming().requested_by == uid())
+          || hasAnyPerm(['procurement.manage', 'procurement.approve'])
+        );
+      allow delete: if isActive() && existing().requested_by == uid() && existing().status == 'draft';
+    }
+
+    match /purchase_request_items/{id} {
+      function editable(r) {
+        return (isActive() && r.requested_by == uid() && r.status in ['draft', 'rejected']) || hasPerm('procurement.manage');
+      }
+      function inheritsFrom(r) { return incoming().project_id == r.project_id && incoming().requested_by == r.requested_by; }
+      allow read: if (hasPerm('procurement.view') && canAccess(resource.data.project_id))
+        || (isActive() && resource.data.requested_by == uid());
+      allow create: if editable(get(path('purchase_requests', incoming().request_id)).data)
+        && inheritsFrom(get(path('purchase_requests', incoming().request_id)).data)
+        && incoming().quantity > 0;
+      allow update: if (editable(get(path('purchase_requests', existing().request_id)).data)
+                        && editable(get(path('purchase_requests', incoming().request_id)).data)
+                        && inheritsFrom(getAfter(path('purchase_requests', incoming().request_id)).data))
+        // the engine's sync of inherited fields when the request changes
+        || (onlyChanges(['project_id', 'requested_by'])
+            && inheritsFrom(getAfter(path('purchase_requests', existing().request_id)).data));
+      allow delete: if editable(get(path('purchase_requests', existing().request_id)).data);
+    }
+
+    match /purchase_orders/{id} {
+      function poTransitionOk() {
+        return keeps(['number', 'created_by', 'created_at'])
+          && (incoming().status != 'sent' || existing().status in ['approved', 'sent'])
+          && ((incoming().status == 'approved' && existing().status != 'approved'
+                 && hasPerm('procurement.approve') && incoming().approved_by == uid())
+              || ((incoming().status != 'approved' || existing().status == 'approved')
+                  && keeps(['approved_by', 'approved_at'])));
+      }
+      // status maintained by goods-received postings (storekeepers lack procurement.manage)
+      function grnStatus() {
+        return hasAnyPerm(['procurement.manage', 'inventory.manage'])
+          && onlyChanges(['status', 'updated_at'])
+          && existing().status in ['approved', 'sent', 'partially_received']
+          && incoming().status in ['partially_received', 'received'];
+      }
+      allow read: if hasAnyPerm(['procurement.view', 'finance.view', 'inventory.manage']) && canAccess(resource.data.project_id);
+      allow create: if hasPerm('procurement.manage')
+        && incoming().created_by == uid()
+        && incoming().status in ['draft', 'pending_approval']
+        && incoming().approved_by == null;
+      allow update: if (hasAnyPerm(['procurement.manage', 'procurement.approve']) && poTransitionOk()) || grnStatus();
+      allow delete: if hasPerm('procurement.manage') && existing().status == 'draft';
+    }
+
+    match /purchase_order_items/{id} {
+      function po(poId) { return get(path('purchase_orders', poId)).data; }
+      function openPo(poId) { return po(poId).status in ['draft', 'pending_approval']; }
+      // received quantity raised by a goods-received line (+10% tolerance)
+      function grnReceive() {
+        return hasAnyPerm(['procurement.manage', 'inventory.manage'])
+          && onlyChanges(['received_qty'])
+          && incoming().received_qty > existing().received_qty
+          && incoming().received_qty <= existing().quantity * 1.1 + 0.0005
+          && po(existing().po_id).status in ['approved', 'sent', 'partially_received'];
+      }
+      allow read: if hasAnyPerm(['procurement.view', 'finance.view', 'inventory.manage']) && canAccess(resource.data.project_id);
+      allow create: if hasPerm('procurement.manage') && openPo(incoming().po_id)
+        && incoming().project_id == po(incoming().po_id).project_id
+        && incoming().quantity > 0 && incoming().received_qty == 0;
+      allow update: if (hasPerm('procurement.manage') && openPo(existing().po_id) && openPo(incoming().po_id)
+                        && incoming().project_id == getAfter(path('purchase_orders', incoming().po_id)).data.project_id)
+        || grnReceive()
+        // the engine's sync of the inherited project_id
+        || (onlyChanges(['project_id'])
+            && incoming().project_id == getAfter(path('purchase_orders', existing().po_id)).data.project_id);
+      allow delete: if hasPerm('procurement.manage') && openPo(existing().po_id);
+    }
+
+    match /goods_received/{id} {
+      allow read: if hasAnyPerm(['procurement.view', 'inventory.view']) && canAccess(resource.data.project_id);
+      allow create: if hasAnyPerm(['procurement.manage', 'inventory.manage'])
+        && incoming().received_by == uid()
+        && (incoming().po_id == null
+            || get(path('purchase_orders', incoming().po_id)).data.status in ['approved', 'sent', 'partially_received']);
+      allow update: if projectSetNull();
+    }
+
+    match /goods_received_items/{id} {
+      function grn() { return getAfter(path('goods_received', incoming().grn_id)).data; }
+      // the PO line's received_qty rises by exactly this quantity in the same transaction
+      function poLineReceived() {
+        let before = get(path('purchase_order_items', incoming().po_item_id)).data;
+        let after = getAfter(path('purchase_order_items', incoming().po_item_id)).data;
+        return before.po_id == grn().po_id
+          && near(after.received_qty - before.received_qty, incoming().quantity_received);
+      }
+      allow read: if hasAnyPerm(['procurement.view', 'inventory.view']) && canAccess(resource.data.project_id);
+      allow create: if hasAnyPerm(['procurement.manage', 'inventory.manage'])
+        && incoming().quantity_received > 0
+        && incoming().project_id == grn().project_id
+        && existsAfter(path('inventory_transactions', id))
+        && (incoming().po_item_id == null || poLineReceived());
+      // immutable; only the engine's sync of the inherited project_id
+      allow update: if onlyChanges(['project_id'])
+        && incoming().project_id == getAfter(path('goods_received', existing().grn_id)).data.project_id;
+    }
+
+    match /supplier_invoices/{id} {
+      allow read: if hasAnyPerm(['procurement.view', 'finance.view']);
+      allow create, delete: if hasAnyPerm(['procurement.manage', 'finance.manage']);
+      // finance.approve holders: payment approval/void recomputes the invoice status (finance domain hook)
+      allow update: if hasAnyPerm(['procurement.manage', 'finance.manage'])
+        || (hasPerm('finance.approve') && onlyChanges(['status', 'updated_at'])
+            && incoming().status in ['unpaid', 'partially_paid', 'paid']);
+    }
+
+    // ---------------------------------------------------------------- equipment
+    match /equipment/{id} {
+      allow read: if hasPerm('equipment.view');
+      allow create, delete: if hasPerm('equipment.manage');
+      // usage logs by site staff raise the meter reading (was a SECURITY DEFINER trigger)
+      allow update: if hasPerm('equipment.manage')
+        || (hasPerm('site.report') && onlyChanges(['meter_reading', 'updated_at'])
+            && incoming().meter_reading > existing().meter_reading);
+    }
+
+    match /equipment_assignments/{id} {
+      allow read: if hasPerm('equipment.view') && canAccess(resource.data.project_id);
+      allow create: if hasPerm('equipment.manage') && canAccess(incoming().project_id);
+      allow update: if hasPerm('equipment.manage') && canAccess(existing().project_id) && canAccess(incoming().project_id);
+      allow delete: if hasPerm('equipment.manage') && canAccess(existing().project_id);
+    }
+
+    match /equipment_usage_logs/{id} {
+      allow read: if hasPerm('equipment.view') && canAccess(resource.data.project_id);
+      allow create: if hasAnyPerm(['equipment.manage', 'site.report']) && canAccess(incoming().project_id)
+        && incoming().created_by == uid();
+      allow update, delete: if hasPerm('equipment.manage');
+    }
+
+    match /maintenance_records/{id} {
+      allow read: if hasPerm('equipment.view');
+      allow write: if hasPerm('equipment.manage');
+    }
+    // ================================================================ workforce / HR + finance (…0400 + RLS in …0500)
+    // List queries the engine issues (src/backend/domains/people_finance.ts scopes):
+    //   company-wide users: unconstrained; others: project_id == pid per project (+ project_id == null);
+    //   self-service: employees.profile_id == uid, <table>.employee_profile_id == uid (payroll: + status == 'paid').
+    // employee_profile_id is a denormalised copy of employees.profile_id (set by the engine on insert,
+    // re-synced when the employee's linked account changes).
+
+    // the engine re-pointing employee_profile_id after employees.profile_id changed in the same transaction
+    function pfOwnerSync() {
+      return hasPerm('hr.manage')
+        && onlyChanges(['employee_profile_id', 'updated_at'])
+        && incoming().employee_profile_id == getAfter(path('employees', existing().employee_id)).data.profile_id;
+    }
+    // employee_profile_id untouched, or re-derived correctly from the (new) employee
+    function pfOwnerOk() {
+      return (incoming().employee_profile_id == existing().employee_profile_id && incoming().employee_id == existing().employee_id)
+        || incoming().employee_profile_id == getAfter(path('employees', incoming().employee_id)).data.profile_id;
+    }
+    function pfOwnerOnCreate() {
+      return incoming().employee_profile_id == getAfter(path('employees', incoming().employee_id)).data.profile_id;
+    }
+    function pfSelf(data) {
+      return isActive() && data.employee_profile_id == uid();
+    }
+
+    // ---------------------------------------------------------------- employees (directory, non-confidential)
+    match /employees/{id} {
+      allow read: if hasPerm('hr.view') || (isActive() && resource.data.profile_id == uid());
+      allow create: if hasPerm('hr.manage');
+      // re-linking a user account must be able to re-sync the employee's attendance / leave / pay rows
+      allow update: if hasPerm('hr.manage')
+        && (keeps(['profile_id']) || (hasPerm('hr.payroll') && hasPerm('hr.view') && hasPerm('projects.view_all')));
+      allow delete: if hasPerm('hr.manage') && hasPerm('hr.payroll') && hasPerm('projects.view_all');
+    }
+
+    // ---------------------------------------------------------------- confidential pay details
+    match /employee_compensation/{employeeId} {
+      allow read: if hasPerm('hr.payroll') || pfSelf(resource.data);
+      allow create: if hasPerm('hr.payroll') && incoming().employee_id == employeeId && pfOwnerOnCreate();
+      allow update: if (hasPerm('hr.payroll') && keeps(['employee_id']) && pfOwnerOk()) || pfOwnerSync();
+      allow delete: if hasPerm('hr.payroll');
+    }
+
+    // ---------------------------------------------------------------- site assignments (project-scoped)
+    match /employee_assignments/{id} {
+      allow read: if hasPerm('hr.view') && canAccess(resource.data.project_id);
+      allow create: if hasPerm('hr.manage') && incoming().project_id != null && canAccess(incoming().project_id);
+      allow update: if hasPerm('hr.manage') && canAccess(existing().project_id)
+        && incoming().project_id != null && canAccess(incoming().project_id);
+      allow delete: if hasPerm('hr.manage') && canAccess(existing().project_id);
+    }
+
+    // ---------------------------------------------------------------- attendance & timesheets
+    // Document id = {employee_id}__{work_date} (UNIQUE), so a duplicate on a project the writer
+    // cannot see turns into an update of an existing document and is rejected here.
+    // employee_profile_id is not re-checked on create: the attendance sheet saves many employees in one
+    // transaction and Firestore allows only 20 document lookups per transaction (writers are trusted
+    // hr.attendance holders; the engine derives the value).
+    match /attendance/{id} {
+      allow read: if (hasPerm('hr.view') && canAccess(resource.data.project_id)) || pfSelf(resource.data);
+      allow create: if hasPerm('hr.attendance') && canAccess(incoming().project_id);
+      allow update: if (hasPerm('hr.attendance') && canAccess(existing().project_id) && canAccess(incoming().project_id) && pfOwnerOk())
+        || pfOwnerSync();
+      allow delete: if hasPerm('hr.manage');
+    }
+
+    // ---------------------------------------------------------------- leave
+    match /leave_requests/{id} {
+      allow read: if hasPerm('hr.view') || pfSelf(resource.data);
+      allow create: if pfOwnerOnCreate()
+        && (hasPerm('hr.manage')
+            || (isActive() && incoming().employee_profile_id == uid()
+                && incoming().status == 'pending'
+                && incoming().approved_by == null && incoming().approved_at == null
+                && incoming().created_by == uid()));
+      allow update: if (hasPerm('hr.manage')
+                        && pfOwnerOk()
+                        // a decision always records who made it
+                        && (!(incoming().status in ['approved', 'rejected']) || incoming().status == existing().status
+                            || incoming().approved_by == uid()))
+        || (isActive()
+            && existing().status == 'pending' && existing().employee_profile_id == uid()
+            && incoming().employee_profile_id == uid() && pfOwnerOk()
+            && incoming().status in ['pending', 'cancelled']
+            && keeps(['approved_by', 'approved_at', 'created_by']))
+        || pfOwnerSync();
+      // only through the employee cascade (no delete policy existed for users)
+      allow delete: if hasPerm('hr.manage');
+    }
+
+    // ---------------------------------------------------------------- payroll (confidential)
+    // employee_profile_id is not re-checked on create (generate_payroll writes up to 200 payslips per
+    // transaction; 20-lookup limit) — only hr.payroll holders, who can read all payslips anyway, may create.
+    match /payroll_records/{id} {
+      allow read: if hasPerm('hr.payroll')
+        || (pfSelf(resource.data) && resource.data.status == 'paid');
+      allow create: if hasPerm('hr.payroll');
+      allow update: if (hasPerm('hr.payroll') && pfOwnerOk()) || pfOwnerSync();
+      allow delete: if hasPerm('hr.payroll');
+    }
+
+    // ---------------------------------------------------------------- client invoices
+    match /client_invoices/{id} {
+      allow read: if hasPerm('finance.view') && canAccess(resource.data.project_id);
+      allow create: if hasPerm('finance.manage');
+      // approvers move the payment status when approving / voiding a receipt against the invoice
+      allow update: if hasPerm('finance.manage')
+        || (hasPerm('finance.approve') && onlyChanges(['status', 'updated_at'])
+            && incoming().status in ['issued', 'partially_paid', 'paid']);
+      allow delete: if hasPerm('finance.manage');
+    }
+
+    // ---------------------------------------------------------------- financial transactions
+    // Segregation of duties, approval only with finance.approve, approved = locked (void with reason only),
+    // and no deletes at all (no `allow delete`).
+    match /financial_transactions/{id} {
+      function seniorApprover() { return isActive() && role().key in ['super_admin', 'managing_director']; }
+
+      allow read: if hasPerm('finance.view') && canAccess(resource.data.project_id);
+
+      allow create: if hasPerm('finance.manage') && canAccess(incoming().project_id)
+        && incoming().created_by == uid()
+        && ((incoming().status == 'pending' && incoming().approved_by == null)
+            || (seniorApprover() && incoming().approved_by == uid()));
+
+      allow update: if hasAnyPerm(['finance.manage', 'finance.approve'])
+        && keeps(['number', 'created_by', 'created_at'])
+        && (
+          // (a) edit / re-submit / void a pending or rejected transaction — no decision, approver untouched
+          (existing().status in ['pending', 'rejected']
+            && (incoming().status == existing().status || incoming().status in ['pending', 'void'])
+            && keeps(['approved_by', 'approved_at'])
+            && canAccess(incoming().project_id))
+          // (b) approve / reject: finance.approve, never your own transaction (unless MD / super admin),
+          //     and nothing else may change in the same write
+          || (existing().status in ['pending', 'rejected']
+            && incoming().status in ['approved', 'rejected'] && incoming().status != existing().status
+            && hasPerm('finance.approve')
+            && incoming().approved_by == uid()
+            && (incoming().status == 'rejected' || existing().created_by != uid() || seniorApprover())
+            && onlyChanges(['status', 'approved_by', 'approved_at', 'updated_at']))
+          // (c) void an approved transaction: finance.approve + reason, nothing else changes
+          || (existing().status == 'approved' && incoming().status == 'void'
+            && hasPerm('finance.approve')
+            && incoming().void_reason is string && incoming().void_reason.trim().size() > 0
+            && onlyChanges(['status', 'void_reason', 'updated_at']))
+        );
+    }
+    // ================================================================ AI Intelligence (src/shared/ai/contract.ts)
+    // Cloud Functions (Admin SDK) write emails, drafts, alerts, usage, status and accounts; rules do not apply to them.
+    // The web app reads business data for the assistant under the caller's own rules (never through the server).
+    // List queries the engine issues (src/backend/domains/ai.ts scopes):
+    //   ai_chats, ai_memories: user_id == uid; ai_activity: unconstrained for ai.manage, else actor_id == uid; others unconstrained.
+
+    // AI permission = the role's permission (hasPerm, incl. super_admin) OR an individual grant in user_access/{uid}
+    // (User Management → Email access; written only by the adminUsers function). Grants never bypass isActive().
+    function aiGrant(p) {
+      let g = path('user_access', uid());
+      return exists(g) && get(g).data.perms is list && p in get(g).data.perms;
+    }
+    function aiPerm(p) { return hasPerm(p) || (isActive() && aiGrant(p)); }
+
+    // a user may read their own grant; user administrators read all; nobody writes from the app
+    match /user_access/{id} {
+      allow read: if isActive() && (id == uid() || hasPerm('users.manage'));
+      allow write: if false;
+    }
+
+    function aiAlertOk() {
+      return incoming().status in ['acknowledged', 'resolved']
+        && (incoming().acknowledged_by == existing().acknowledged_by || incoming().acknowledged_by == uid());
+    }
+    function aiValidParties(list) {
+      return list is list && list.size() <= 50;
+    }
+
+    // ---------------------------------------------------------------- email intelligence
+    match /ai_emails/{id} {
+      allow read: if aiPerm('ai.email');
+    }
+
+    match /ai_email_drafts/{id} {
+      allow read: if aiPerm('ai.email');
+      // drafts are created and sent by functions (emailGenerateReply / emailSendDraft)
+      // a person may edit the reply text and recipients while it is a draft, or discard it
+      allow update: if aiPerm('ai.email') && existing().status == 'draft'
+        && ((incoming().status == 'draft'
+              && onlyChanges(['body', 'subject', 'to', 'cc', 'language', 'updated_at'])
+              && incoming().body is string && incoming().body.size() <= 50000
+              && incoming().subject is string && incoming().subject.size() <= 300
+              && aiValidParties(incoming().to) && incoming().to.size() > 0 && aiValidParties(incoming().cc)
+              && incoming().language in ['en', 'sw'])
+            || (incoming().status == 'discarded' && onlyChanges(['status', 'updated_at'])));
+    }
+
+    match /email_accounts/{id} {
+      allow read: if aiPerm('ai.manage') || aiPerm('ai.email');
+    }
+
+    // OAuth refresh tokens / IMAP passwords and OAuth nonces: server only
+    match /email_account_secrets/{id} {
+      allow read, write: if false;
+    }
+    match /email_oauth_states/{id} {
+      allow read, write: if false;
+    }
+    // AI provider API keys entered in the AI Control Center: encrypted, read and written only by Cloud Functions
+    match /ai_provider_keys/{id} {
+      allow read, write: if false;
+    }
+
+    // ---------------------------------------------------------------- alerts, reports, chats
+    match /ai_alerts/{id} {
+      allow read: if aiPerm('ai.view');
+      allow update: if aiPerm('ai.view')
+        && onlyChanges(['status', 'acknowledged_by', 'acknowledged_at', 'resolved_at'])
+        && aiAlertOk();
+    }
+
+    match /ai_reports/{id} {
+      allow read: if aiPerm('ai.view');
+      allow create: if aiPerm('ai.view') && incoming().generated_by == uid()
+        && incoming().content_md is string && incoming().content_md.size() <= 400000;
+    }
+
+    match /ai_chats/{id} {
+      allow read: if aiPerm('ai.view') && resource.data.user_id == uid();
+      allow create: if aiPerm('ai.view') && incoming().user_id == uid();
+      allow update: if aiPerm('ai.view') && existing().user_id == uid() && incoming().user_id == uid();
+      allow delete: if aiPerm('ai.view') && existing().user_id == uid();
+    }
+
+    // the assistant's memory: what the user asked it to remember, private to that user
+    match /ai_memories/{id} {
+      allow read: if aiPerm('ai.view') && resource.data.user_id == uid();
+      allow create: if aiPerm('ai.view') && incoming().user_id == uid()
+        && incoming().text is string && incoming().text.size() > 0 && incoming().text.size() <= 500;
+      allow update: if aiPerm('ai.view') && existing().user_id == uid() && incoming().user_id == uid()
+        && incoming().text is string && incoming().text.size() > 0 && incoming().text.size() <= 500;
+      allow delete: if aiPerm('ai.view') && existing().user_id == uid();
+    }
+
+    // ---------------------------------------------------------------- knowledge base
+    match /ai_knowledge/{id} {
+      allow read: if aiPerm('ai.view');
+      allow create: if aiPerm('ai.manage') && incoming().created_by == uid();
+      allow update: if aiPerm('ai.manage') && keeps(['created_by', 'created_at']);
+      allow delete: if aiPerm('ai.manage');
+    }
+
+    // ---------------------------------------------------------------- audit trail & usage
+    match /ai_activity/{id} {
+      allow read: if aiPerm('ai.manage') || (aiPerm('ai.view') && resource.data.actor_id == uid());
+      // the app records its own chat / report / voice runs and confirmed assistant actions; everything else is written by functions
+      allow create: if aiPerm('ai.view') && incoming().actor_id == uid() && incoming().action in ['chat', 'report', 'voice', 'assistant_action'];
+    }
+
+    match /ai_usage/{id} {
+      allow read: if aiPerm('ai.manage');
+    }
+
+    // ---------------------------------------------------------------- settings & status
+    match /ai_settings/{id} {
+      allow read: if aiPerm('ai.view');
+      allow create, update: if aiPerm('ai.manage') && id == 'settings' && incoming().id == 'settings';
+    }
+
+    match /ai_status/{id} {
+      allow read: if aiPerm('ai.view');
+    }
+
+    // everything not matched above is denied
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

@@ -1,0 +1,7 @@
+
+    // everything not matched above is denied
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

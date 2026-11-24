@@ -1,0 +1,55 @@
+rules_version = '2';
+
+// =============================================================================
+// ABCkit — Firestore security rules (the enforcement layer that replaced PostgreSQL RLS)
+// GENERATED: edit the fragments in firebase/rules/*.rules, then run `npm run rules:build`.
+//
+// Data model: one collection per former SQL table, document id = primary key
+// (composite keys joined with "__", e.g. project_members/{projectId}__{userId}).
+// profiles/{uid}.role_id -> roles/{roleId}; roles/{roleId}.perms = permission keys.
+// =============================================================================
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------------------------------------------------------- identity
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function path(coll, id) { return /databases/$(database)/documents/$(coll)/$(id); }
+    function profile() { return get(path('profiles', uid())).data; }
+    function hasProfile() { return signedIn() && exists(path('profiles', uid())); }
+    // Server-side session checks (Firebase ID tokens carry auth_time = when the user signed in):
+    //  - absolute session lifetime: 30 days after sign-in the user must sign in again
+    //  - "sign out of all devices" / admin "force sign-out": session_revocations/{uid}.at (server timestamp)
+    //    invalidates every token issued before it
+    function sessionValid() {
+      let signedInAt = request.auth.token.auth_time * 1000;
+      let rev = path('session_revocations', uid());
+      return request.time.toMillis() < signedInAt + 2592000000
+        && (!exists(rev) || signedInAt > get(rev).data.at.toMillis());
+    }
+    function isActive() { return hasProfile() && profile().is_active == true && sessionValid(); }
+    function role() { return get(path('roles', profile().role_id)).data; }
+    function isSuper() { return isActive() && role().key == 'super_admin'; }
+    function hasPerm(p) { return isActive() && (role().key == 'super_admin' || p in role().perms); }
+    function hasAnyPerm(ps) { return isActive() && (role().key == 'super_admin' || role().perms.hasAny(ps)); }
+
+    // ---------------------------------------------------------------- projects
+    // company-wide viewers, the project manager, or listed members (project_members/{pid}__{uid})
+    function canAccess(pid) {
+      return pid == null
+        || hasPerm('projects.view_all')
+        || (isActive() && exists(path('project_members', pid + '__' + uid())))
+        || (isActive() && get(path('projects', pid)).data.project_manager_id == uid());
+    }
+
+    // ---------------------------------------------------------------- write helpers
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function changedKeys() { return request.resource.data.diff(resource.data).affectedKeys(); }
+    function onlyChanges(keys) { return changedKeys().hasOnly(keys); }
+    function keeps(keys) { return !changedKeys().hasAny(keys); }
+    function bootstrapping() {
+      return signedIn()
+        && !exists(path('meta', 'bootstrap'))
+        && getAfter(path('meta', 'bootstrap')).data.owner == uid();
+    }
